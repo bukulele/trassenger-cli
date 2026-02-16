@@ -1,4 +1,4 @@
-use crossterm::event::{self, Event as CrosstermEvent, KeyEvent};
+use crossterm::event::{self, Event as CrosstermEvent, KeyEvent, KeyEventKind};
 use futures::{FutureExt, StreamExt};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -52,8 +52,11 @@ impl EventHandler {
                     maybe_event = event => {
                         match maybe_event {
                             Some(Ok(CrosstermEvent::Key(key))) => {
-                                if sender.send(AppEvent::Key(key)).is_err() {
-                                    break; // Channel closed, stop listener
+                                // Filter out key release events (Windows sends both press and release)
+                                if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat {
+                                    if sender.send(AppEvent::Key(key)).is_err() {
+                                        break; // Channel closed, stop listener
+                                    }
                                 }
                             }
                             Some(Ok(CrosstermEvent::Paste(text))) => {
