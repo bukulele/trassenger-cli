@@ -11,7 +11,10 @@ mod logger;
 
 use app::App;
 use crossterm::{
-    event::{DisableMouseCapture, EnableMouseCapture, DisableBracketedPaste, EnableBracketedPaste},
+    event::{
+        DisableMouseCapture, EnableMouseCapture, DisableBracketedPaste, EnableBracketedPaste,
+        KeyboardEnhancementFlags, PushKeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -34,7 +37,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste,
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+        )
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -64,7 +76,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         terminal.backend_mut(),
         LeaveAlternateScreen,
         DisableMouseCapture,
-        DisableBracketedPaste
+        DisableBracketedPaste,
+        PopKeyboardEnhancementFlags
     )?;
     terminal.show_cursor()?;
 

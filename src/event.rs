@@ -14,12 +14,8 @@ pub enum AppEvent {
     Tick,
     /// Polling interval updated (adaptive polling)
     PollingIntervalUpdate(u64),
-    /// Reset polling interval to minimum (user is active)
-    ResetPollingInterval,
     /// Paste event (for drag-and-drop file paths)
     Paste(String),
-    /// Application should quit
-    Quit,
 }
 
 /// Event handler for the TUI application

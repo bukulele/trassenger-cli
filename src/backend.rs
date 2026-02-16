@@ -83,7 +83,7 @@ impl PollingService {
     }
 
     /// Start the polling service (spawns background task)
-    pub fn start(mut self) {
+    pub fn start(self) {
         tokio::spawn(async move {
             self.run().await;
         });
@@ -178,6 +178,10 @@ impl PollingService {
 
         // Process each message
         for server_msg in server_messages {
+            crate::logger::log_to_file(&format!(
+                "Processing message {} from server (server timestamp: {})",
+                server_msg.id, server_msg.timestamp
+            ));
             match self.process_message(&server_msg, queue_id).await {
                 Ok(message) => {
                     // Save to database

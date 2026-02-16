@@ -20,8 +20,12 @@ tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 futures = "0.3"
 
-# Cryptography
-sodiumoxide = "0.2"
+# Cryptography (pure Rust - no C dependencies)
+chacha20poly1305 = "0.10"
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+sha2 = "0.10"
+rand = "0.8"
 
 # HTTP client
 reqwest = { version = "0.11", features = ["json"] }

@@ -1,6 +1,6 @@
 use crate::app::{App, InputMode, MenuState};
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Paragraph, Wrap},
@@ -321,7 +321,7 @@ pub fn render_contacts_view(f: &mut Frame, app: &App, area: Rect) {
 }
 
 /// Render full-screen import view
-pub fn render_import_view(f: &mut Frame, app: &App, area: Rect) {
+pub fn render_import_view(f: &mut Frame, _app: &App, area: Rect) {
     let lines = vec![
         Line::from(""),
         Line::from(Span::styled("Import Contact", Style::default().fg(Color::White).add_modifier(Modifier::BOLD))),

@@ -32,7 +32,6 @@ pub struct ServerMessage {
     pub id: String,
     pub timestamp: i64,
     pub data: String,
-    pub meta: MessageMeta,
 }
 
 #[derive(Debug, Deserialize)]

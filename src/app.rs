@@ -48,8 +48,6 @@ pub struct App {
     // Message input
     /// Current message being typed
     pub message_input: String,
-    /// Message scroll offset
-    pub message_scroll: usize,
     /// Slash command menu state
     pub show_slash_menu: bool,
     /// Selected command in slash menu
@@ -134,7 +132,6 @@ impl App {
             selected_peer_index: 0,
 
             message_input: String::new(),
-            message_scroll: 0,
             show_slash_menu: false,
             slash_menu_index: 0,
 
@@ -172,13 +169,7 @@ impl App {
             AppEvent::PollingIntervalUpdate(interval) => {
                 self.current_polling_interval = interval;
             }
-            AppEvent::ResetPollingInterval => {
-                // This event is sent TO backend, not FROM backend, so ignore it here
-            }
             AppEvent::Paste(text) => self.handle_paste(text),
-            AppEvent::Quit => {
-                self.should_quit = true;
-            }
         }
     }
 
@@ -255,12 +246,19 @@ impl App {
                 self.slash_menu_index = 0;
             }
 
-            // Navigation in chat view
-            KeyCode::Up if self.menu_state == MenuState::Closed => {
+            // Navigation in contacts view only
+            KeyCode::Up if self.menu_state == MenuState::Contacts => {
                 self.handle_up();
             }
-            KeyCode::Down if self.menu_state == MenuState::Closed => {
+            KeyCode::Down if self.menu_state == MenuState::Contacts => {
                 self.handle_down();
+            }
+            KeyCode::Enter if self.menu_state == MenuState::Contacts => {
+                // Select contact and return to chat
+                if !self.peers.is_empty() && self.selected_peer_index < self.peers.len() {
+                    self.menu_state = MenuState::Closed;
+                    self.load_messages_for_selected_peer();
+                }
             }
 
             // Start typing (only in chat view with contacts)
@@ -369,13 +367,6 @@ impl App {
             self.selected_peer_index += 1;
             self.load_messages_for_selected_peer();
         }
-    }
-
-    /// Handle Enter key
-    fn handle_enter(&mut self) {
-        // Start editing/typing message
-        self.input_mode = InputMode::Editing;
-        self.status_message = "".to_string();
     }
 
     /// Handle submit action (Enter in editing mode)
@@ -893,11 +884,6 @@ impl App {
                 }
             }
         }
-    }
-
-    /// Get selected peer name for display
-    pub fn selected_peer_name(&self) -> Option<&str> {
-        self.peers.get(self.selected_peer_index).map(|p| p.name.as_str())
     }
 
     /// Set the polling command sender
