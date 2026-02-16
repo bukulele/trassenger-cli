@@ -16,12 +16,6 @@ pub struct Keypair {
     pub sign_sk: Vec<u8>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct PublicKeyInfo {
-    pub encrypt_pk_hex: String,
-    pub sign_pk_hex: String,
-}
-
 /// Initialize crypto (no-op for pure Rust, kept for compatibility)
 pub fn init() -> Result<(), String> {
     Ok(())

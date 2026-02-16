@@ -128,12 +128,21 @@ fn render_ui(f: &mut ratatui::Frame, app: &App) {
         layout::{Constraint, Direction, Layout},
     };
 
+    // Calculate input area height dynamically for slash menu
+    let input_height = if app.show_slash_menu && app.menu_state == app::MenuState::Closed {
+        // Slash menu: 5 commands + separator + input line = 7 lines
+        7
+    } else {
+        // Normal: separator + prompt line = 2 lines (+ 1 for padding)
+        3
+    };
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(0),     // Main content (fills remaining space)
-            Constraint::Length(3),  // Input area (separator + prompt line + empty)
-            Constraint::Length(2),  // Hints (2 lines of text)
+            Constraint::Min(0),              // Main content (fills remaining space)
+            Constraint::Length(input_height), // Input area (dynamic height)
+            Constraint::Length(2),           // Hints (2 lines of text)
         ])
         .split(f.area());
 
