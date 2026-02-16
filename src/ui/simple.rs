@@ -240,11 +240,18 @@ pub fn render_hints(f: &mut Frame, app: &App, area: Rect) {
                     ]),
                 ]
             } else if app.input_mode == InputMode::Editing {
-                // Editing mode in chat
+                // Editing mode in chat - show appropriate newline key
+                let newline_hint = if app.keyboard_enhancements_supported {
+                    "Shift+Enter"
+                } else {
+                    "Ctrl+J"
+                };
                 vec![
                     Line::from(vec![
                         Span::styled("Enter", Style::default().fg(Color::DarkGray)),
                         Span::styled(" send  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(newline_hint, Style::default().fg(Color::DarkGray)),
+                        Span::styled(" newline  ", Style::default().fg(Color::DarkGray)),
                         Span::styled("Esc", Style::default().fg(Color::DarkGray)),
                         Span::styled(" cancel", Style::default().fg(Color::DarkGray)),
                     ]),

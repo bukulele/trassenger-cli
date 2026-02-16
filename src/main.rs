@@ -37,16 +37,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(
+
+    // Basic terminal setup (works everywhere)
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)?;
+
+    // Try keyboard enhancements (modern terminals only - gracefully fail on old Windows)
+    let keyboard_enhancements_supported = execute!(
         stdout,
-        EnterAlternateScreen,
-        EnableMouseCapture,
-        EnableBracketedPaste,
         PushKeyboardEnhancementFlags(
             KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                 | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
         )
-    )?;
+    ).is_ok();
+
+    if !keyboard_enhancements_supported {
+        logger::log_to_file("Keyboard enhancements not supported, using fallback keys (Ctrl+J for newline)");
+    }
+
+    // Tell app about keyboard enhancement support
+    app.keyboard_enhancements_supported = keyboard_enhancements_supported;
+
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 

@@ -80,6 +80,9 @@ pub struct App {
 
     /// Sender for polling commands
     polling_sender: Option<tokio::sync::mpsc::UnboundedSender<crate::backend::PollingCommand>>,
+
+    /// Whether keyboard enhancements are supported (for Shift+Enter)
+    pub keyboard_enhancements_supported: bool,
 }
 
 impl App {
@@ -148,6 +151,7 @@ impl App {
 
             should_quit: false,
             polling_sender: None,
+            keyboard_enhancements_supported: false, // Will be set by main.rs
         };
 
         // Load messages for the first peer if available
@@ -330,8 +334,13 @@ impl App {
                 self.status_message = "".to_string();
             }
 
+            KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                // Ctrl+J adds newline (works on all terminals)
+                self.handle_char_input('\n');
+            }
+
             KeyCode::Enter => {
-                // Shift+Enter adds newline, plain Enter submits
+                // Shift+Enter adds newline (modern terminals), plain Enter submits
                 if key.modifiers.contains(KeyModifiers::SHIFT) {
                     self.handle_char_input('\n');
                 } else {
