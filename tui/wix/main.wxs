@@ -38,13 +38,26 @@
       <Directory Id='LocalAppDataFolder'>
         <Directory Id='APPLICATIONFOLDER' Name='Trassenger'>
 
+          <!--
+            ICE38: per-user components that install to the user profile must use
+            a registry key under HKCU as their KeyPath, not a file.
+            ICE64: the install directory must appear in the RemoveFile table.
+          -->
           <Component Id='TuiBinary' Guid='A1B2C3D4-E5F6-7890-ABCD-EF1234567890'>
             <File
               Id='TuiExe'
               Name='trassenger-tui.exe'
               DiskId='1'
-              Source='target\release\trassenger-tui.exe'
+              Source='target\release\trassenger-tui.exe'/>
+            <RegistryValue
+              Root='HKCU'
+              Key='Software\Trassenger'
+              Name='tui_installed'
+              Type='integer'
+              Value='1'
               KeyPath='yes'/>
+            <!-- Remove install dir on uninstall (satisfies ICE64) -->
+            <RemoveFolder Id='RemoveAppFolder' Directory='APPLICATIONFOLDER' On='uninstall'/>
           </Component>
 
           <Component Id='DaemonBinary' Guid='B2C3D4E5-F6A7-8901-BCDE-F12345678901'>
@@ -52,14 +65,19 @@
               Id='DaemonExe'
               Name='trassenger-daemon.exe'
               DiskId='1'
-              Source='target\release\trassenger-daemon.exe'
+              Source='target\release\trassenger-daemon.exe'/>
+            <RegistryValue
+              Root='HKCU'
+              Key='Software\Trassenger'
+              Name='daemon_installed'
+              Type='integer'
+              Value='1'
               KeyPath='yes'/>
           </Component>
 
           <!--
             Desktop shortcut points to the DAEMON, not the TUI directly.
             The daemon shows the tray icon and opens a terminal with the TUI on click.
-            This way double-clicking the desktop icon starts the whole app correctly.
           -->
           <Component Id='DesktopShortcut' Guid='C3D4E5F6-A7B8-9012-CDEF-234567890123'>
             <Shortcut
