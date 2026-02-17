@@ -280,11 +280,18 @@ fn launch_tui() {
 
 #[cfg(target_os = "macos")]
 fn app_installed(name: &str) -> bool {
-    Command::new("osascript")
-        .args(["-e", &format!("exists application \"{}\"", name)])
+    // Use mdfind to check if the app bundle actually exists on disk
+    Command::new("mdfind")
+        .args(["kMDItemCFBundleIdentifier", "-onlyin", "/Applications"])
         .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "true")
-        .unwrap_or(false)
+        .ok();
+    // Check /Applications and ~/Applications directly
+    let home = std::env::var("HOME").unwrap_or_default();
+    let candidates = [
+        format!("/Applications/{}.app", name),
+        format!("{}/Applications/{}.app", home, name),
+    ];
+    candidates.iter().any(|p| std::path::Path::new(p).exists())
 }
 
 #[cfg(target_os = "macos")]
@@ -295,12 +302,23 @@ fn launch_tui_macos(tui: &str) {
         return;
     }
     // iTerm2: AppleScript
-    if app_installed("iTerm2") {
+    if app_installed("iTerm") {
         let script = format!(
-            "tell application \"iTerm2\" to create window with default profile command \"{}\"",
+            "tell application \"iTerm2\"\n\
+             activate\n\
+             set newWindow to (create window with default profile)\n\
+             tell current session of newWindow\n\
+             write text \"{}\"\n\
+             end tell\n\
+             end tell",
             tui
         );
-        let _ = Command::new("osascript").args(["-e", &script]).spawn();
+        let _ = Command::new("osascript")
+            .args(["-e", &script])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
         return;
     }
     // Alacritty: -e flag
