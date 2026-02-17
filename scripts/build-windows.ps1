@@ -12,7 +12,7 @@ cargo build --workspace --release
 
 Write-Host "==> Building MSI with cargo-wix..."
 # cargo-wix uses wix/main.wxs automatically
-cargo wix --nocapture --output "target/release/Trassenger-0.1.0-x86_64.msi"
+cargo wix --nocapture --output "target/release/Trassenger-0.2.0-x86_64.msi"
 
-Write-Host "==> MSI created: target/release/Trassenger-0.1.0-x86_64.msi"
+Write-Host "==> MSI created: target/release/Trassenger-0.2.0-x86_64.msi"
 Write-Host "==> Done!"

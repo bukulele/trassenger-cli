@@ -1,6 +1,6 @@
 [package]
 name = "trassenger-tui"
-version = "0.1.0"
+version = "0.2.0"
 description = "Terminal-based encrypted messenger with zero server-side knowledge"
 authors = ["you"]
 edition = "2021"
