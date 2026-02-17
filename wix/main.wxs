@@ -1,0 +1,141 @@
+<?xml version='1.0' encoding='windows-1252'?>
+<!--
+  WiX installer template for Trassenger
+  Installs:
+    - trassenger-tui.exe     (TUI binary)
+    - trassenger-daemon.exe  (background daemon / tray icon)
+  Install location: %LOCALAPPDATA%\Trassenger\  (per-user, no admin required)
+-->
+<Wix xmlns='http://schemas.microsoft.com/wix/2006/wi'>
+
+  <Product
+    Id='*'
+    Name='Trassenger'
+    UpgradeCode='D7A3B8C1-4E2F-4A6D-9B1E-5C3F7A8D2E4B'
+    Manufacturer='Trassenger'
+    Language='1033'
+    Codepage='1252'
+    Version='0.1.0'>
+
+    <Package
+      Id='*'
+      Keywords='Installer'
+      Description='Trassenger encrypted messenger'
+      Manufacturer='Trassenger'
+      InstallerVersion='450'
+      Languages='1033'
+      Compressed='yes'
+      InstallScope='perUser'/>
+
+    <MajorUpgrade
+      Schedule='afterInstallInitialize'
+      DowngradeErrorMessage='A newer version of [ProductName] is already installed. Setup will now exit.'/>
+
+    <MediaTemplate EmbedCab='yes'/>
+
+    <Directory Id='TARGETDIR' Name='SourceDir'>
+      <!-- Per-user install: %LOCALAPPDATA%\Trassenger -->
+      <Directory Id='LocalAppDataFolder'>
+        <Directory Id='APPLICATIONFOLDER' Name='Trassenger'>
+
+          <Component Id='TuiBinary' Guid='A1B2C3D4-E5F6-7890-ABCD-EF1234567890'>
+            <File
+              Id='TuiExe'
+              Name='trassenger-tui.exe'
+              DiskId='1'
+              Source='target\release\trassenger-tui.exe'
+              KeyPath='yes'/>
+          </Component>
+
+          <Component Id='DaemonBinary' Guid='B2C3D4E5-F6A7-8901-BCDE-F12345678901'>
+            <File
+              Id='DaemonExe'
+              Name='trassenger-daemon.exe'
+              DiskId='1'
+              Source='target\release\trassenger-daemon.exe'
+              KeyPath='yes'/>
+          </Component>
+
+          <!--
+            Desktop shortcut points to the DAEMON, not the TUI directly.
+            The daemon shows the tray icon and opens a terminal with the TUI on click.
+            This way double-clicking the desktop icon starts the whole app correctly.
+          -->
+          <Component Id='DesktopShortcut' Guid='C3D4E5F6-A7B8-9012-CDEF-234567890123'>
+            <Shortcut
+              Id='TuiDesktopShortcut'
+              Directory='DesktopFolder'
+              Name='Trassenger'
+              Description='Trassenger encrypted messenger'
+              Target='[APPLICATIONFOLDER]trassenger-daemon.exe'
+              WorkingDirectory='APPLICATIONFOLDER'/>
+            <RemoveFolder Id='RemoveDesktopFolder' Directory='DesktopFolder' On='uninstall'/>
+            <RegistryValue
+              Root='HKCU'
+              Key='Software\Trassenger'
+              Name='installed'
+              Type='integer'
+              Value='1'
+              KeyPath='yes'/>
+          </Component>
+
+          <!-- Start menu shortcut — also points to daemon -->
+          <Component Id='StartMenuShortcut' Guid='D4E5F6A7-B8C9-0123-DEF0-345678901234'>
+            <Shortcut
+              Id='TuiStartMenuShortcut'
+              Directory='ProgramMenuFolder'
+              Name='Trassenger'
+              Description='Trassenger encrypted messenger'
+              Target='[APPLICATIONFOLDER]trassenger-daemon.exe'
+              WorkingDirectory='APPLICATIONFOLDER'/>
+            <RemoveFolder Id='RemoveStartMenuFolder' Directory='ProgramMenuFolder' On='uninstall'/>
+            <RegistryValue
+              Root='HKCU'
+              Key='Software\Trassenger'
+              Name='start_menu'
+              Type='integer'
+              Value='1'
+              KeyPath='yes'/>
+          </Component>
+
+        </Directory>
+      </Directory>
+
+      <Directory Id='DesktopFolder' Name='Desktop'/>
+      <Directory Id='ProgramMenuFolder' Name='Programs'/>
+    </Directory>
+
+    <Feature
+      Id='MainFeature'
+      Title='Trassenger'
+      Description='Terminal-based encrypted messenger with background daemon'
+      Level='1'
+      ConfigurableDirectory='APPLICATIONFOLDER'
+      AllowAdvertise='no'
+      Display='expand'
+      Absent='disallow'>
+
+      <ComponentRef Id='TuiBinary'/>
+      <ComponentRef Id='DaemonBinary'/>
+      <ComponentRef Id='DesktopShortcut'/>
+      <ComponentRef Id='StartMenuShortcut'/>
+    </Feature>
+
+    <UIRef Id='WixUI_InstallDir'/>
+    <Property Id='WIXUI_INSTALLDIR' Value='APPLICATIONFOLDER'/>
+
+    <!-- Post-install: launch daemon (shows tray icon immediately after install) -->
+    <CustomAction
+      Id='LaunchDaemon'
+      FileKey='DaemonExe'
+      ExeCommand=''
+      Execute='immediate'
+      Impersonate='yes'
+      Return='asyncNoWait'/>
+
+    <InstallExecuteSequence>
+      <Custom Action='LaunchDaemon' After='InstallFinalize'>NOT Installed</Custom>
+    </InstallExecuteSequence>
+
+  </Product>
+</Wix>

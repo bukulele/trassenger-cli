@@ -1,0 +1,211 @@
+// Trassenger TUI - Terminal-based encrypted messenger
+mod event;
+mod app;
+mod ui;
+
+// Re-export shared modules from lib so crate:: references in submodules resolve
+pub(crate) use trassenger_lib::logger;
+pub(crate) use trassenger_lib::storage;
+pub(crate) use trassenger_lib::crypto;
+pub(crate) use trassenger_lib::config;
+pub(crate) use trassenger_lib::mailbox;
+
+// TUI-specific modules (not in lib)
+mod backend;
+
+use app::App;
+use crossterm::{
+    event::{
+        DisableMouseCapture, EnableMouseCapture, DisableBracketedPaste, EnableBracketedPaste,
+        KeyboardEnhancementFlags, PushKeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    },
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use event::EventHandler;
+use ratatui::{
+    backend::CrosstermBackend,
+    Terminal,
+};
+use std::io;
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize logger (no console output)
+    logger::init_logger()?;
+
+    // Signal to daemon that TUI is running
+    write_tui_running_flag();
+
+    // Initialize application state
+    let mut app = App::initialize().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+    // Setup terminal
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+
+    // Basic terminal setup (works everywhere)
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)?;
+
+    // Try keyboard enhancements (modern terminals only - gracefully fail on old Windows)
+    let keyboard_enhancements_supported = execute!(
+        stdout,
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        )
+    ).is_ok();
+
+    if !keyboard_enhancements_supported {
+        logger::log_to_file("Keyboard enhancements not supported, using fallback keys (Ctrl+J for newline)");
+    }
+
+    // Tell app about keyboard enhancement support
+    app.keyboard_enhancements_supported = keyboard_enhancements_supported;
+
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    // Setup event handler
+    let mut event_handler = EventHandler::new();
+    event_handler.spawn_keyboard_listener();
+    event_handler.spawn_tick_timer(Duration::from_millis(250));
+
+    // Start polling service
+    let (polling_service, polling_cmd_sender) = backend::PollingService::new(
+        app.config.server_url.clone(),
+        app.keypair.encrypt_sk.clone(),
+        app.keypair.sign_pk.clone(),
+        event_handler.sender(),
+    );
+    polling_service.start();
+
+    // Give app access to polling command sender
+    app.set_polling_sender(polling_cmd_sender);
+
+    // Main event loop
+    let result = run_app(&mut terminal, &mut app, &mut event_handler).await;
+
+    // Restore terminal
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        DisableBracketedPaste,
+        PopKeyboardEnhancementFlags
+    )?;
+    terminal.show_cursor()?;
+
+    if let Err(err) = result {
+        logger::log_to_file(&format!("Error: {:?}", err));
+    }
+
+    // Remove TUI running flag so daemon knows TUI has exited
+    remove_tui_running_flag();
+
+    Ok(())
+}
+
+fn write_tui_running_flag() {
+    if let Ok(dir) = storage::get_app_data_dir() {
+        let _ = std::fs::write(dir.join("tui.running"), "1");
+    }
+}
+
+fn remove_tui_running_flag() {
+    if let Ok(dir) = storage::get_app_data_dir() {
+        let _ = std::fs::remove_file(dir.join("tui.running"));
+    }
+}
+
+async fn run_app(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+    event_handler: &mut EventHandler,
+) -> io::Result<()> {
+    loop {
+        // Draw UI
+        terminal.draw(|f| {
+            render_ui(f, app);
+        })?;
+
+        // Handle events
+        if let Some(event) = event_handler.next().await {
+            app.handle_event(event);
+        }
+
+        // Check if should quit
+        if app.should_quit {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+fn render_ui(f: &mut ratatui::Frame, app: &App) {
+    use ratatui::{
+        layout::{Constraint, Direction, Layout},
+    };
+
+    // Calculate input area height dynamically based on content
+    let terminal_width = f.area().width as usize;
+    let input_height = if app.show_slash_menu && app.menu_state == app::MenuState::Closed {
+        // Slash menu: commands + separator + input line
+        let commands = app.get_filtered_slash_commands();
+        (commands.len() + 2) as u16
+    } else {
+        // Count rendered lines in the current input ("> " prefix = 2 chars)
+        let content_width = terminal_width.saturating_sub(2).max(1);
+        let input_text = match app.menu_state {
+            app::MenuState::ImportContact => &app.contact_import_input,
+            app::MenuState::ExportContact => &app.contact_export_name,
+            _ => &app.message_input,
+        };
+        let text_lines: u16 = input_text.split('\n').map(|seg| {
+            let chars = seg.chars().count();
+            ((chars + content_width - 1) / content_width).max(1) as u16
+        }).sum();
+        let text_lines = text_lines.max(2); // minimum 2 text lines
+        let max_input = f.area().height / 3; // cap at 1/3 of screen
+        (text_lines + 2).min(max_input) // +2 for top and bottom separators
+    };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(0),              // Main content (fills remaining space)
+            Constraint::Length(input_height), // Input area (dynamic height)
+            Constraint::Length(2),           // Hints (2 lines of text)
+        ])
+        .split(f.area());
+
+    // Render different views based on state
+    match app.menu_state {
+        app::MenuState::Closed => {
+            // Normal chat view
+            ui::render_message_list(f, app, chunks[0]);
+            ui::render_input_area(f, app, chunks[1]);
+        }
+        app::MenuState::Contacts => {
+            ui::render_contacts_view(f, app, chunks[0]);
+            ui::render_view_hints(f, "Esc to return to chat", chunks[1]);
+        }
+        app::MenuState::ImportContact => {
+            ui::render_import_view(f, app, chunks[0]);
+            ui::render_input_area(f, app, chunks[1]);
+        }
+        app::MenuState::ExportContact => {
+            ui::render_export_view(f, app, chunks[0]);
+            ui::render_input_area(f, app, chunks[1]);
+        }
+        app::MenuState::Settings => {
+            ui::render_settings_view(f, app, chunks[0]);
+            ui::render_view_hints(f, "Esc to return to chat", chunks[1]);
+        }
+    }
+
+    // Hints (always at bottom)
+    ui::render_hints(f, app, chunks[2]);
+}

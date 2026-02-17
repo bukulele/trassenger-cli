@@ -3,136 +3,117 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
-  workflow_dispatch:
+      - 'v*'           # trigger on tags like v0.1.0
+  workflow_dispatch:   # also allow manual trigger from GitHub UI
 
 jobs:
-  build:
-    name: Build ${{ matrix.target }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        include:
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            artifact_name: trassenger-macos-intel
-            asset_name: trassenger-macos-intel
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            artifact_name: trassenger-macos-arm
-            asset_name: trassenger-macos-arm
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact_name: trassenger-windows.exe
-            asset_name: trassenger-windows.exe
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            artifact_name: trassenger-linux
-            asset_name: trassenger-linux
-
+  # ── macOS: build .dmg ─────────────────────────────────────────────────────
+  build-macos:
+    runs-on: macos-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
         with:
-          targets: ${{ matrix.target }}
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: macos-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Install dependencies (Windows)
-        if: matrix.os == 'windows-latest'
-        run: |
-          choco install llvm -y
+      - name: Build release binaries
+        run: cargo build --workspace --release
 
-      - name: Install dependencies (Ubuntu)
-        if: matrix.os == 'ubuntu-latest'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y pkg-config
+      - name: Install create-dmg
+        run: brew install create-dmg
 
-      - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+      - name: Create .app bundle and .dmg
+        run: bash scripts/build-macos.sh
 
-      - name: Prepare artifact (Windows)
-        if: matrix.os == 'windows-latest'
-        run: |
-          copy target\${{ matrix.target }}\release\trassenger-tui.exe ${{ matrix.artifact_name }}
-
-      - name: Prepare artifact (Unix)
-        if: matrix.os != 'windows-latest'
-        run: |
-          cd target/${{ matrix.target }}/release
-          cp trassenger-tui ../../../${{ matrix.artifact_name }}
-          chmod +x ../../../${{ matrix.artifact_name }}
-
-      - name: Strip binary (Unix)
-        if: matrix.os != 'windows-latest' && matrix.target != 'x86_64-pc-windows-gnu'
-        run: strip ${{ matrix.artifact_name }}
-
-      - name: Upload artifact
+      - name: Upload DMG
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact_name }}
-          path: ${{ matrix.artifact_name }}
+          name: macos-dmg
+          path: target/release/Trassenger-*.dmg
 
-  release:
-    name: Create Release
-    needs: build
-    runs-on: ubuntu-latest
+  # ── Windows: build .msi ───────────────────────────────────────────────────
+  build-windows:
+    runs-on: windows-latest   # x86_64 Windows runner — works for your friend's Intel machine
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Download all artifacts
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: windows-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install WiX Toolset v3
+        run: |
+          choco install wixtoolset -y
+          echo "C:\Program Files (x86)\WiX Toolset v3.11\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Install cargo-wix
+        run: cargo install cargo-wix
+
+      - name: Build release binaries
+        run: cargo build --workspace --release
+
+      - name: Build MSI
+        # --package points cargo-wix at the tui crate which owns wix/main.wxs
+        run: cargo wix --package trassenger-tui --nocapture --output target\release\Trassenger-0.1.0-x86_64.msi
+
+      - name: Upload MSI
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-msi
+          path: target\release\Trassenger-*.msi
+
+  # ── Create GitHub Release with both artifacts ──────────────────────────────
+  release:
+    needs: [build-macos, build-windows]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    steps:
+      - name: Download macOS artifact
         uses: actions/download-artifact@v4
         with:
-          path: artifacts
+          name: macos-dmg
+          path: dist/
 
-      - name: Create checksums
-        run: |
-          cd artifacts
-          for dir in */; do
-            cd "$dir"
-            for file in *; do
-              sha256sum "$file" > "$file.sha256"
-            done
-            cd ..
-          done
-
-      - name: Create Release
-        uses: softprops/action-gh-release@v1
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
         with:
-          files: artifacts/**/*
-          draft: false
-          prerelease: false
+          name: windows-msi
+          path: dist/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
           generate_release_notes: true
           body: |
-            ## Downloads
+            ## Trassenger ${{ github.ref_name }}
 
-            ### macOS
-            - **Apple Silicon (M1/M2/M3)**: `trassenger-macos-arm`
-            - **Intel**: `trassenger-macos-intel`
+            ### Download & Install
 
-            ### Windows
-            - **64-bit**: `trassenger-windows.exe`
+            | Platform | File |
+            |----------|------|
+            | **macOS** | `.dmg` — open and drag to Applications |
+            | **Windows (64-bit)** | `.msi` — double-click to install |
 
-            ### Linux
-            - **64-bit**: `trassenger-linux`
-
-            ## Installation
-
-            **macOS/Linux:**
-            ```bash
-            chmod +x trassenger-*
-            ./trassenger-*
-            ```
-
-            **Windows:**
-            ```
-            Double-click trassenger-windows.exe
-            ```
-
-            ## What's Changed
-            See below for full changelog.
+            After installing on Windows, the daemon starts automatically and puts a tray icon in the taskbar. Click it to open the TUI.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
