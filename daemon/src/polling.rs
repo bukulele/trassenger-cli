@@ -56,9 +56,13 @@ async fn polling_loop(_state: Arc<Mutex<DaemonState>>, tx: std::sync::mpsc::Send
             let _ = tx.send(DaemonEvent::TuiClosed);
         }
 
-        // Poll all queues
-        let new_msgs = poll_all_queues(&client, &keypair, tui_running).await;
-        if new_msgs > 0 && !tui_running {
+        // Poll all queues only when TUI is not running — TUI handles its own polling
+        let new_msgs = if !tui_running {
+            poll_all_queues(&client, &keypair).await
+        } else {
+            0
+        };
+        if new_msgs > 0 {
             unread += new_msgs;
             let _ = tx.send(DaemonEvent::UnreadCount(unread));
             send_notification(new_msgs);
@@ -75,7 +79,6 @@ async fn polling_loop(_state: Arc<Mutex<DaemonState>>, tx: std::sync::mpsc::Send
 async fn poll_all_queues(
     client: &MailboxClient,
     keypair: &Keypair,
-    tui_running: bool,
 ) -> usize {
     let peers = match storage::load_peers() {
         Ok(p) => p,
@@ -84,7 +87,7 @@ async fn poll_all_queues(
 
     let mut total = 0;
     for peer in &peers {
-        match poll_queue(client, keypair, &peer.queue_id, tui_running).await {
+        match poll_queue(client, keypair, &peer.queue_id).await {
             Ok(count) => total += count,
             Err(e) => eprintln!("[daemon] Poll error for {}: {}", peer.queue_id, e),
         }
@@ -96,7 +99,6 @@ async fn poll_queue(
     client: &MailboxClient,
     keypair: &Keypair,
     queue_id: &str,
-    tui_running: bool,
 ) -> Result<usize, String> {
     let messages = client.fetch_messages(queue_id).await?;
     if messages.is_empty() {
@@ -107,13 +109,10 @@ async fn poll_queue(
     for msg in &messages {
         match process_message(msg, queue_id, keypair) {
             Ok(message) => {
-                // If TUI is not running, save and notify; if TUI is running it handles its own
-                if !tui_running {
-                    if let Ok(conn) = storage::init_message_db() {
-                        let _ = storage::save_message(&conn, &message);
-                    }
-                    count += 1;
+                if let Ok(conn) = storage::init_message_db() {
+                    let _ = storage::save_message(&conn, &message);
                 }
+                count += 1;
                 // Delete from server
                 let _ = client.delete_message(queue_id, &msg.id).await;
             }

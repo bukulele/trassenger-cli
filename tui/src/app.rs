@@ -178,7 +178,7 @@ impl App {
             AppEvent::Key(key) => self.handle_key(key),
             AppEvent::NewMessage(message) => self.handle_new_message(message),
             AppEvent::Tick => {
-                // Periodic UI refresh - nothing to do here
+                self.load_messages_for_selected_peer();
             }
             AppEvent::PollingIntervalUpdate(interval) => {
                 self.current_polling_interval = interval;
