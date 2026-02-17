@@ -4,6 +4,9 @@
 //   main thread: tray icon + event loop (required by macOS)
 //   tokio thread: background polling every 60s
 
+// Hide the console window on Windows so only the tray icon appears
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -251,14 +254,16 @@ fn launch_tui() {
 
     #[cfg(target_os = "windows")]
     {
-        // Try Windows Terminal first, fall back to cmd /c start (opens default terminal)
+        // Try Windows Terminal first, fall back to cmd /c start
+        // Note: `start` interprets the first quoted arg as window title,
+        // so pass `""` as title then the path as the program.
         if Command::new("wt.exe")
             .args(["--title", "Trassenger", "--", &tui])
             .spawn()
             .is_err()
         {
             let _ = Command::new("cmd.exe")
-                .args(["/c", "start", "Trassenger", &tui])
+                .args(["/c", "start", "", &tui])
                 .spawn();
         }
     }
