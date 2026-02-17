@@ -119,11 +119,16 @@ pub fn decrypt_message(
 
 /// Sign a message using Ed25519
 pub fn sign_message(message: &[u8], sign_sk: &[u8]) -> Result<Vec<u8>, String> {
-    if sign_sk.len() != 32 {
-        return Err("Invalid signing secret key length".to_string());
-    }
+    // Accept both 32-byte seed and 64-byte expanded key (sodiumoxide compat)
+    let seed: [u8; 32] = if sign_sk.len() == 32 {
+        sign_sk.try_into().unwrap()
+    } else if sign_sk.len() == 64 {
+        sign_sk[..32].try_into().unwrap()
+    } else {
+        return Err("Invalid signing key length".to_string());
+    };
 
-    let sk_bytes: [u8; 32] = sign_sk.try_into().unwrap();
+    let sk_bytes: [u8; 32] = seed;
     let signing_key = SigningKey::from_bytes(&sk_bytes);
     let signature = signing_key.sign(message);
 

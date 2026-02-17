@@ -48,30 +48,101 @@ fn render_messages_content(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let messages: Vec<Line> = app.messages.iter().map(|msg| {
+    // Work out how many rendered rows each message takes (accounting for \n and wrapping).
+    // We need this to know which messages are visible in the current scroll position.
+    let area_width = area.width.max(1) as usize;
+
+    // prefix = "→ [HH:MM:SS] " -- compute per message below
+    struct MsgMeta {
+        rows: usize,
+    }
+
+    let meta: Vec<MsgMeta> = app.messages.iter().map(|msg| {
+        let timestamp = format_smart_timestamp(msg.timestamp);
+        let prefix_len = 2 + 1 + timestamp.len() + 2; // "→ " + "[" + ts + "] "
+        let content_width = area_width.saturating_sub(prefix_len).max(1);
+        let mut rows = 0usize;
+        for segment in msg.content.split('\n') {
+            let chars = segment.chars().count();
+            rows += ((chars + content_width - 1) / content_width).max(1);
+        }
+        MsgMeta { rows }
+    }).collect();
+
+    let total_rows: usize = meta.iter().map(|m| m.rows).sum();
+
+    // Clamp scroll offset so you can't scroll past the top.
+    let max_offset = total_rows.saturating_sub(area.height as usize);
+    let scroll_offset = app.chat_scroll_offset.min(max_offset);
+
+    // Find which message and row-within-message to start rendering from.
+    // We want to render starting at row (total_rows - area.height - scroll_offset) from the top.
+    let start_row = total_rows
+        .saturating_sub(area.height as usize)
+        .saturating_sub(scroll_offset);
+
+    // Walk messages, skipping until we reach start_row, then render.
+    let mut lines: Vec<Line> = Vec::with_capacity(area.height as usize);
+    let mut row_cursor = 0usize;
+
+    for (msg, m) in app.messages.iter().zip(meta.iter()) {
+        let msg_end = row_cursor + m.rows;
+        if msg_end <= start_row {
+            row_cursor = msg_end;
+            continue;
+        }
+
         let timestamp = format_smart_timestamp(msg.timestamp);
         let color = if msg.is_outbound { Color::Cyan } else { Color::Green };
         let arrow = if msg.is_outbound { "→" } else { "←" };
+        let prefix = format!("{} [{}] ", arrow, timestamp);
+        let prefix_len = prefix.chars().count();
+        let content_width = area_width.saturating_sub(prefix_len).max(1);
 
-        Line::from(vec![
-            Span::styled(format!("{} ", arrow), Style::default().fg(color)),
-            Span::styled(format!("[{}] ", timestamp), Style::default().fg(Color::DarkGray)),
-            Span::styled(&msg.content, Style::default().fg(Color::White)),
-        ])
-    }).collect();
+        // Expand message into individual rendered rows.
+        let mut msg_rows: Vec<Line> = Vec::with_capacity(m.rows);
+        let mut first = true;
+        for segment in msg.content.split('\n') {
+            let chars: Vec<char> = segment.chars().collect();
+            if chars.is_empty() {
+                msg_rows.push(if first {
+                    first = false;
+                    Line::from(vec![Span::styled(prefix.clone(), Style::default().fg(color))])
+                } else {
+                    Line::from("")
+                });
+                continue;
+            }
+            let mut offset = 0;
+            while offset < chars.len() {
+                let chunk: String = chars[offset..chars.len().min(offset + content_width)].iter().collect();
+                msg_rows.push(if first {
+                    first = false;
+                    Line::from(vec![
+                        Span::styled(prefix.clone(), Style::default().fg(color)),
+                        Span::styled(chunk, Style::default().fg(Color::White)),
+                    ])
+                } else {
+                    Line::from(vec![
+                        Span::raw(" ".repeat(prefix_len)),
+                        Span::styled(chunk, Style::default().fg(Color::White)),
+                    ])
+                });
+                offset += content_width;
+            }
+        }
 
-    // Calculate scroll to show latest messages at bottom
-    let num_messages = messages.len() as u16;
-    let scroll_offset = if num_messages > area.height {
-        num_messages.saturating_sub(area.height)
-    } else {
-        0
-    };
+        // Skip rows of this message that are above start_row.
+        let skip = start_row.saturating_sub(row_cursor);
+        lines.extend(msg_rows.into_iter().skip(skip));
 
-    let paragraph = Paragraph::new(messages)
-        .wrap(Wrap { trim: false })
-        .scroll((scroll_offset, 0));
+        row_cursor = msg_end;
+        if lines.len() >= area.height as usize {
+            break;
+        }
+    }
 
+    let paragraph = Paragraph::new(lines);
     f.render_widget(paragraph, area);
 }
 
@@ -113,75 +184,79 @@ pub fn render_input_area(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    // Thin separator line
     let separator = "─".repeat(area.width as usize);
-    let separator_area = Rect {
-        x: area.x,
-        y: area.y,
-        width: area.width,
-        height: 1,
-    };
-    let separator_widget = Paragraph::new(separator)
-        .style(Style::default().fg(Color::DarkGray));
-    f.render_widget(separator_widget, separator_area);
+    let sep_style = Style::default().fg(Color::DarkGray);
 
-    // Render prompt and input below separator
+    // Top separator
+    let top_sep_area = Rect { x: area.x, y: area.y, width: area.width, height: 1 };
+    f.render_widget(Paragraph::new(separator.clone()).style(sep_style), top_sep_area);
+
+    // Bottom separator (last row of area)
+    let bot_sep_area = Rect { x: area.x, y: area.y + area.height - 1, width: area.width, height: 1 };
+    f.render_widget(Paragraph::new(separator).style(sep_style), bot_sep_area);
+
+    // Text area between the two separators
     let input_area = Rect {
         x: area.x,
         y: area.y + 1,
         width: area.width,
-        height: area.height.saturating_sub(1),
+        height: area.height.saturating_sub(2),
     };
 
     // Determine what to show based on current view
-    let (prompt_text, prompt_style) = match app.menu_state {
-        MenuState::ImportContact => {
-            if app.input_mode == InputMode::Editing {
-                (
-                    format!("> {}_", app.contact_import_input),
-                    Style::default().fg(Color::White)
-                )
-            } else {
-                (
-                    "> ".to_string(),
-                    Style::default().fg(Color::DarkGray)
-                )
+    if app.input_mode == InputMode::Editing {
+        let lines = match app.menu_state {
+            MenuState::ImportContact => {
+                vec![Line::from(vec![
+                    Span::styled("> ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(format!("{}_", app.contact_import_input), Style::default().fg(Color::White)),
+                ])]
             }
-        }
-        MenuState::ExportContact => {
-            if app.input_mode == InputMode::Editing {
-                (
-                    format!("> {}_", app.contact_export_name),
-                    Style::default().fg(Color::White)
-                )
-            } else {
-                (
-                    "> ".to_string(),
-                    Style::default().fg(Color::DarkGray)
-                )
+            MenuState::ExportContact => {
+                vec![Line::from(vec![
+                    Span::styled("> ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(format!("{}_", app.contact_export_name), Style::default().fg(Color::White)),
+                ])]
             }
-        }
-        _ => {
-            // Normal chat input
-            if app.input_mode == InputMode::Editing {
-                (
-                    format!("> {}_", app.message_input),
-                    Style::default().fg(Color::White)
-                )
-            } else {
-                (
-                    "> ".to_string(),
-                    Style::default().fg(Color::DarkGray)
-                )
-            }
-        }
-    };
+            _ => {
+                // Split at cursor to render cursor indicator
+                let chars: Vec<char> = app.message_input.chars().collect();
+                let cursor = app.input_cursor.min(chars.len());
+                let before: String = chars[..cursor].iter().collect();
+                let after: String = chars[cursor..].iter().collect();
 
-    let paragraph = Paragraph::new(prompt_text)
-        .style(prompt_style)
-        .wrap(Wrap { trim: false });
-
-    f.render_widget(paragraph, input_area);
+                // Build lines: split on \n within before/after
+                let full = format!("{}\x00{}", before, after); // \x00 marks cursor pos
+                let mut lines: Vec<Line> = Vec::new();
+                let mut first = true;
+                for segment in full.split('\n') {
+                    let prefix = if first { first = false; "> " } else { "" };
+                    if let Some(cursor_pos) = segment.find('\x00') {
+                        let seg_before = &segment[..cursor_pos];
+                        let seg_after = &segment[cursor_pos + 1..];
+                        lines.push(Line::from(vec![
+                            Span::styled(prefix, Style::default().fg(Color::DarkGray)),
+                            Span::styled(seg_before.to_string(), Style::default().fg(Color::White)),
+                            Span::styled("_", Style::default().fg(Color::Cyan)),
+                            Span::styled(seg_after.to_string(), Style::default().fg(Color::White)),
+                        ]));
+                    } else {
+                        lines.push(Line::from(vec![
+                            Span::styled(prefix, Style::default().fg(Color::DarkGray)),
+                            Span::styled(segment.to_string(), Style::default().fg(Color::White)),
+                        ]));
+                    }
+                }
+                lines
+            }
+        };
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), input_area);
+    } else {
+        f.render_widget(
+            Paragraph::new(Span::styled("> ", Style::default().fg(Color::DarkGray))),
+            input_area,
+        );
+    }
 }
 
 /// Render slash command menu
@@ -266,7 +341,9 @@ pub fn render_hints(f: &mut Frame, app: &App, area: Rect) {
                         Span::styled("/", Style::default().fg(Color::DarkGray)),
                         Span::styled(" commands  ", Style::default().fg(Color::DarkGray)),
                         Span::styled("↑↓", Style::default().fg(Color::DarkGray)),
-                        Span::styled(" switch contact  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(" scroll  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Ctrl+P/N", Style::default().fg(Color::DarkGray)),
+                        Span::styled(" contact  ", Style::default().fg(Color::DarkGray)),
                         Span::styled("│ ", Style::default().fg(Color::DarkGray)),
                         Span::styled(
                             format!("polling: {}s", app.current_polling_interval),
@@ -395,7 +472,7 @@ pub fn render_settings_view(f: &mut Frame, app: &App, area: Rect) {
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("Current: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Adaptive (live): ", Style::default().fg(Color::DarkGray)),
             Span::raw(format!("{}s", app.current_polling_interval)),
         ]),
     ];

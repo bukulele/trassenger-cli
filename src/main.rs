@@ -46,7 +46,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         stdout,
         PushKeyboardEnhancementFlags(
             KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
         )
     ).is_ok();
 
@@ -128,13 +127,27 @@ fn render_ui(f: &mut ratatui::Frame, app: &App) {
         layout::{Constraint, Direction, Layout},
     };
 
-    // Calculate input area height dynamically for slash menu
+    // Calculate input area height dynamically based on content
+    let terminal_width = f.area().width as usize;
     let input_height = if app.show_slash_menu && app.menu_state == app::MenuState::Closed {
-        // Slash menu: 5 commands + separator + input line = 7 lines
-        7
+        // Slash menu: commands + separator + input line
+        let commands = app.get_filtered_slash_commands();
+        (commands.len() + 2) as u16
     } else {
-        // Normal: separator + prompt line = 2 lines (+ 1 for padding)
-        3
+        // Count rendered lines in the current input ("> " prefix = 2 chars)
+        let content_width = terminal_width.saturating_sub(2).max(1);
+        let input_text = match app.menu_state {
+            app::MenuState::ImportContact => &app.contact_import_input,
+            app::MenuState::ExportContact => &app.contact_export_name,
+            _ => &app.message_input,
+        };
+        let text_lines: u16 = input_text.split('\n').map(|seg| {
+            let chars = seg.chars().count();
+            ((chars + content_width - 1) / content_width).max(1) as u16
+        }).sum();
+        let text_lines = text_lines.max(2); // minimum 2 text lines
+        let max_input = f.area().height / 3; // cap at 1/3 of screen
+        (text_lines + 2).min(max_input) // +2 for top and bottom separators
     };
 
     let chunks = Layout::default()

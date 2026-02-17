@@ -48,6 +48,8 @@ pub struct App {
     // Message input
     /// Current message being typed
     pub message_input: String,
+    /// Cursor position in the active input (char index)
+    pub input_cursor: usize,
     /// Slash command menu state
     pub show_slash_menu: bool,
     /// Selected command in slash menu
@@ -74,6 +76,9 @@ pub struct App {
     pub status_message: String,
     /// Current polling interval (for adaptive polling)
     pub current_polling_interval: u64,
+
+    /// Chat scroll offset (0 = at bottom, higher = scrolled up)
+    pub chat_scroll_offset: usize,
 
     /// Should the app quit
     pub should_quit: bool,
@@ -135,6 +140,7 @@ impl App {
             selected_peer_index: 0,
 
             message_input: String::new(),
+            input_cursor: 0,
             show_slash_menu: false,
             slash_menu_index: 0,
 
@@ -149,6 +155,7 @@ impl App {
             status_message: String::new(),
             current_polling_interval: config.polling_interval_secs,
 
+            chat_scroll_offset: 0,
             should_quit: false,
             polling_sender: None,
             keyboard_enhancements_supported: false, // Will be set by main.rs
@@ -221,6 +228,14 @@ impl App {
                     self.should_quit = true;
                     return;
                 }
+                KeyCode::Char('p') => {
+                    self.handle_up();
+                    return;
+                }
+                KeyCode::Char('n') => {
+                    self.handle_down();
+                    return;
+                }
                 _ => {}
             }
         }
@@ -250,12 +265,18 @@ impl App {
                 self.slash_menu_index = 0;
             }
 
-            // Navigation in contacts view only
+            // Navigation: contacts view = switch peer, chat view = scroll
             KeyCode::Up if self.menu_state == MenuState::Contacts => {
                 self.handle_up();
             }
             KeyCode::Down if self.menu_state == MenuState::Contacts => {
                 self.handle_down();
+            }
+            KeyCode::Up if self.menu_state == MenuState::Closed => {
+                self.chat_scroll_offset = self.chat_scroll_offset.saturating_add(1);
+            }
+            KeyCode::Down if self.menu_state == MenuState::Closed => {
+                self.chat_scroll_offset = self.chat_scroll_offset.saturating_sub(1);
             }
             KeyCode::Enter if self.menu_state == MenuState::Contacts => {
                 // Select contact and return to chat
@@ -269,7 +290,7 @@ impl App {
             KeyCode::Char(c) if self.menu_state == MenuState::Closed => {
                 if !self.peers.is_empty() {
                     self.input_mode = InputMode::Editing;
-                    self.message_input.push(c);
+                    self.handle_char_input(c);
                 } else {
                     self.status_message = "No contacts - type /import to add one".to_string();
                 }
@@ -286,7 +307,7 @@ impl App {
             match key.code {
                 KeyCode::Esc => {
                     self.input_mode = InputMode::Normal;
-                    self.message_input.clear();
+                    self.clear_message_input();
                     self.show_slash_menu = false;
                     self.status_message = "".to_string();
                 }
@@ -330,17 +351,17 @@ impl App {
         match key.code {
             KeyCode::Esc => {
                 self.input_mode = InputMode::Normal;
+                self.message_input.clear();
+                self.input_cursor = 0;
                 self.show_slash_menu = false;
                 self.status_message = "".to_string();
             }
 
             KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                // Ctrl+J adds newline (works on all terminals)
                 self.handle_char_input('\n');
             }
 
             KeyCode::Enter => {
-                // Shift+Enter adds newline (modern terminals), plain Enter submits
                 if key.modifiers.contains(KeyModifiers::SHIFT) {
                     self.handle_char_input('\n');
                 } else {
@@ -350,6 +371,37 @@ impl App {
 
             KeyCode::Backspace => {
                 self.handle_backspace();
+            }
+
+            KeyCode::Delete => {
+                self.handle_delete();
+            }
+
+            KeyCode::Left => {
+                if self.menu_state == MenuState::Closed {
+                    self.input_cursor = self.input_cursor.saturating_sub(1);
+                }
+            }
+
+            KeyCode::Right => {
+                if self.menu_state == MenuState::Closed {
+                    let max = self.message_input.chars().count();
+                    if self.input_cursor < max {
+                        self.input_cursor += 1;
+                    }
+                }
+            }
+
+            KeyCode::Home => {
+                if self.menu_state == MenuState::Closed {
+                    self.input_cursor = 0;
+                }
+            }
+
+            KeyCode::End => {
+                if self.menu_state == MenuState::Closed {
+                    self.input_cursor = self.message_input.chars().count();
+                }
             }
 
             KeyCode::Char(c) => {
@@ -404,25 +456,25 @@ impl App {
         match command {
             "/contacts" | "/c" => {
                 self.menu_state = MenuState::Contacts;
-                self.message_input.clear();
+                self.clear_message_input();
                 self.input_mode = InputMode::Normal;
             }
             "/import" | "/i" => {
                 self.menu_state = MenuState::ImportContact;
                 self.contact_import_input.clear();
-                self.message_input.clear();
+                self.clear_message_input();
                 self.input_mode = InputMode::Editing;
             }
             "/export" | "/e" => {
                 self.menu_state = MenuState::ExportContact;
                 self.contact_export_name.clear();
                 self.contact_export_json.clear();
-                self.message_input.clear();
+                self.clear_message_input();
                 self.input_mode = InputMode::Editing;
             }
             "/settings" | "/s" => {
                 self.menu_state = MenuState::Settings;
-                self.message_input.clear();
+                self.clear_message_input();
                 self.input_mode = InputMode::Normal;
             }
             "/quit" | "/q" => {
@@ -430,7 +482,7 @@ impl App {
             }
             _ => {
                 self.status_message = format!("Unknown command: {}", command);
-                self.message_input.clear();
+                self.clear_message_input();
                 self.input_mode = InputMode::Normal;
             }
         }
@@ -446,7 +498,7 @@ impl App {
 
         if self.peers.is_empty() {
             self.input_mode = InputMode::Normal;
-            self.message_input.clear();  // Clear the unsent message
+            self.clear_message_input();
             self.status_message = "No contacts - import one first".to_string();
             return;
         }
@@ -466,12 +518,13 @@ impl App {
         match self.send_message_to_peer(&peer, &message_content) {
             Ok(message_id) => {
                 self.status_message = "Sent".to_string();
-                self.message_input.clear();
+                self.clear_message_input();
 
                 // Reload messages to show the sent message
                 self.load_messages_for_selected_peer();
 
                 // Reset polling interval - user is active
+                self.current_polling_interval = 5; // show immediately, backend will confirm
                 self.reset_polling_interval();
 
                 crate::logger::log_to_file(&format!("Message sent: {}", message_id));
@@ -817,22 +870,19 @@ impl App {
     fn handle_backspace(&mut self) {
         match self.menu_state {
             MenuState::Closed => {
-                self.message_input.pop();
+                if self.input_cursor > 0 {
+                    let byte_pos = char_to_byte_index(&self.message_input, self.input_cursor - 1);
+                    let next_byte = char_to_byte_index(&self.message_input, self.input_cursor);
+                    self.message_input.drain(byte_pos..next_byte);
+                    self.input_cursor -= 1;
+                }
             }
-            MenuState::ImportContact => {
-                self.contact_import_input.pop();
-            }
-            MenuState::ExportContact => {
-                self.contact_export_name.pop();
-            }
+            MenuState::ImportContact => { self.contact_import_input.pop(); }
+            MenuState::ExportContact => { self.contact_export_name.pop(); }
             MenuState::Settings => {
                 match self.settings_selected_field {
-                    0 => {
-                        self.settings_server_url.pop();
-                    }
-                    1 => {
-                        self.settings_polling_interval.pop();
-                    }
+                    0 => { self.settings_server_url.pop(); }
+                    1 => { self.settings_polling_interval.pop(); }
                     _ => {}
                 }
             }
@@ -840,26 +890,32 @@ impl App {
         }
     }
 
+    /// Delete character at cursor (Delete key)
+    fn handle_delete(&mut self) {
+        if self.menu_state == MenuState::Closed {
+            let max = self.message_input.chars().count();
+            if self.input_cursor < max {
+                let byte_pos = char_to_byte_index(&self.message_input, self.input_cursor);
+                let next_byte = char_to_byte_index(&self.message_input, self.input_cursor + 1);
+                self.message_input.drain(byte_pos..next_byte);
+            }
+        }
+    }
+
     /// Handle character input in editing mode
     fn handle_char_input(&mut self, c: char) {
         match self.menu_state {
             MenuState::Closed => {
-                self.message_input.push(c);
+                let byte_pos = char_to_byte_index(&self.message_input, self.input_cursor);
+                self.message_input.insert(byte_pos, c);
+                self.input_cursor += 1;
             }
-            MenuState::ImportContact => {
-                self.contact_import_input.push(c);
-            }
-            MenuState::ExportContact => {
-                self.contact_export_name.push(c);
-            }
+            MenuState::ImportContact => { self.contact_import_input.push(c); }
+            MenuState::ExportContact => { self.contact_export_name.push(c); }
             MenuState::Settings => {
                 match self.settings_selected_field {
-                    0 => {
-                        self.settings_server_url.push(c);
-                    }
-                    1 => {
-                        self.settings_polling_interval.push(c);
-                    }
+                    0 => { self.settings_server_url.push(c); }
+                    1 => { self.settings_polling_interval.push(c); }
                     _ => {}
                 }
             }
@@ -886,6 +942,7 @@ impl App {
             match storage::load_messages_for_queue(&self.db_conn, &peer.queue_id) {
                 Ok(messages) => {
                     self.messages = messages;
+                    self.chat_scroll_offset = 0;
                     self.status_message = "".to_string();
                 }
                 Err(e) => {
@@ -893,6 +950,12 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Clear message input and reset cursor
+    fn clear_message_input(&mut self) {
+        self.message_input.clear();
+        self.input_cursor = 0;
     }
 
     /// Set the polling command sender
@@ -929,4 +992,12 @@ impl App {
                 .collect()
         }
     }
+}
+
+/// Convert a char index to a byte index in a UTF-8 string.
+pub fn char_to_byte_index(s: &str, char_idx: usize) -> usize {
+    s.char_indices()
+        .nth(char_idx)
+        .map(|(b, _)| b)
+        .unwrap_or(s.len())
 }

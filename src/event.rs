@@ -1,4 +1,4 @@
-use crossterm::event::{self, Event as CrosstermEvent, KeyEvent, KeyEventKind};
+use crossterm::event::{self, Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures::{FutureExt, StreamExt};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -54,6 +54,19 @@ impl EventHandler {
                             Some(Ok(CrosstermEvent::Key(key))) => {
                                 // Filter out key release events (Windows sends both press and release)
                                 if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat {
+                                    // Ctrl+V or Ctrl+Shift+V: read clipboard and emit as Paste
+                                    // (Windows Terminal doesn't support bracketed paste)
+                                    let is_ctrl_v = key.modifiers.contains(KeyModifiers::CONTROL)
+                                        && key.code == KeyCode::Char('v');
+                                    if is_ctrl_v {
+                                        if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                                            if let Ok(text) = clipboard.get_text() {
+                                                let _ = sender.send(AppEvent::Paste(text));
+                                                continue;
+                                            }
+                                        }
+                                        // Clipboard unavailable — fall through and let key pass
+                                    }
                                     if sender.send(AppEvent::Key(key)).is_err() {
                                         break; // Channel closed, stop listener
                                     }
