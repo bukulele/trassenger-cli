@@ -1,6 +1,5 @@
 use crossterm::event::{self, Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures::{FutureExt, StreamExt};
-use std::time::Duration;
 use tokio::sync::mpsc;
 
 /// Application events
@@ -10,8 +9,6 @@ pub enum AppEvent {
     Key(KeyEvent),
     /// New message received from polling service
     NewMessage(crate::storage::Message),
-    /// Periodic tick for UI refresh
-    Tick,
     /// Polling interval updated (adaptive polling)
     PollingIntervalUpdate(u64),
     /// Paste event (for drag-and-drop file paths)
@@ -91,19 +88,6 @@ impl EventHandler {
         });
     }
 
-    /// Spawn the tick timer task for periodic UI refresh
-    pub fn spawn_tick_timer(&self, tick_rate: Duration) {
-        let sender = self.sender.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tick_rate);
-            loop {
-                interval.tick().await;
-                if sender.send(AppEvent::Tick).is_err() {
-                    break; // Channel closed, stop timer
-                }
-            }
-        });
-    }
 }
 
 impl Default for EventHandler {

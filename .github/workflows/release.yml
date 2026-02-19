@@ -71,7 +71,7 @@ jobs:
 
       - name: Build MSI
         # --package points cargo-wix at the tui crate which owns wix/main.wxs
-        run: cargo wix --package trassenger-tui --nocapture --output target\release\Trassenger-0.2.1-x86_64.msi
+        run: cargo wix --package trassenger-tui --nocapture --output target\release\Trassenger-0.3.1-x86_64.msi
 
       - name: Upload MSI
         uses: actions/upload-artifact@v4

@@ -1,18 +1,38 @@
-# Build Trassenger for Windows: produces an .msi installer
-# Prerequisites: cargo-wix (cargo install cargo-wix), WiX Toolset v3
-# Usage: .\scripts\build-windows.ps1
+# Build Trassenger for Windows
+# Usage:
+#   .\scripts\build-windows.ps1           — x86_64 MSI (default)
+#   .\scripts\build-windows.ps1 -Arm      — ARM64 zip
+
+param([switch]$Arm)
 
 $ErrorActionPreference = "Stop"
 
 $RootDir = Split-Path -Parent $PSScriptRoot
 Set-Location $RootDir
 
-Write-Host "==> Building release binaries..."
-cargo build --workspace --release
+if ($Arm) {
+    Write-Host "==> Building release binaries (ARM64)..."
+    cargo build --workspace --release --target aarch64-pc-windows-msvc
 
-Write-Host "==> Building MSI with cargo-wix..."
-# cargo-wix uses wix/main.wxs automatically
-cargo wix --nocapture --output "target/release/Trassenger-0.2.1-x86_64.msi"
+    Write-Host "==> Creating zip..."
+    $Out = "target\release\Trassenger-0.3.1-arm64.zip"
+    $Tmp = "target\release\Trassenger-arm64"
+    New-Item -ItemType Directory -Force -Path $Tmp | Out-Null
+    Copy-Item "target\aarch64-pc-windows-msvc\release\trassenger-daemon.exe" $Tmp\
+    Copy-Item "target\aarch64-pc-windows-msvc\release\trassenger-tui.exe" $Tmp\
+    Copy-Item "README-windows-arm.txt" $Tmp\
+    Compress-Archive -Force -Path "$Tmp\*" -DestinationPath $Out
+    Remove-Item -Recurse -Force $Tmp
 
-Write-Host "==> MSI created: target/release/Trassenger-0.2.1-x86_64.msi"
+    Write-Host "==> Zip created: $Out"
+} else {
+    Write-Host "==> Building release binaries (x86_64)..."
+    cargo build --workspace --release
+
+    Write-Host "==> Building MSI with cargo-wix..."
+    cargo wix --nocapture --output "target\release\Trassenger-0.3.1-x86_64.msi"
+
+    Write-Host "==> MSI created: target\release\Trassenger-0.3.1-x86_64.msi"
+}
+
 Write-Host "==> Done!"

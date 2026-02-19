@@ -4,7 +4,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
-VERSION="0.2.2"
+VERSION="0.3.1"
 APP_NAME="Trassenger"
 BUNDLE_ID="com.trassenger.app"
 

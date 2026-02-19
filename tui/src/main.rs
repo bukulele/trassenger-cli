@@ -2,16 +2,12 @@
 mod event;
 mod app;
 mod ui;
+mod ipc;
 
 // Re-export shared modules from lib so crate:: references in submodules resolve
 pub(crate) use trassenger_lib::logger;
 pub(crate) use trassenger_lib::storage;
-pub(crate) use trassenger_lib::crypto;
 pub(crate) use trassenger_lib::config;
-pub(crate) use trassenger_lib::mailbox;
-
-// TUI-specific modules (not in lib)
-mod backend;
 
 use app::App;
 use crossterm::{
@@ -28,27 +24,50 @@ use ratatui::{
     Terminal,
 };
 use std::io;
-use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logger (no console output)
     logger::init_logger()?;
 
-    // Signal to daemon that TUI is running
-    write_tui_running_flag();
+    // Initialize storage directories (needed for socket path resolution)
+    if let Err(e) = storage::init_storage() {
+        eprintln!("Failed to initialize storage: {}", e);
+        std::process::exit(1);
+    }
 
-    // Initialize application state
-    let mut app = App::initialize().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    // Setup event handler first (we need the sender for IPC)
+    let mut event_handler = EventHandler::new();
+    event_handler.spawn_keyboard_listener();
+
+    // Connect to daemon
+    let daemon_client = match ipc::DaemonClient::connect(event_handler.sender()).await {
+        Ok(client) => client,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            eprintln!("Please start the Trassenger daemon first.");
+            std::process::exit(1);
+        }
+    };
+
+    logger::log_to_file("Connected to daemon");
+
+    // Initialize application state (loads from daemon)
+    let mut app = match App::initialize(daemon_client).await {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("Failed to initialize app: {}", e);
+            std::process::exit(1);
+        }
+    };
 
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
 
-    // Basic terminal setup (works everywhere)
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)?;
 
-    // Try keyboard enhancements (modern terminals only - gracefully fail on old Windows)
+    // Try keyboard enhancements (modern terminals only)
     let keyboard_enhancements_supported = execute!(
         stdout,
         PushKeyboardEnhancementFlags(
@@ -60,28 +79,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         logger::log_to_file("Keyboard enhancements not supported, using fallback keys (Ctrl+J for newline)");
     }
 
-    // Tell app about keyboard enhancement support
     app.keyboard_enhancements_supported = keyboard_enhancements_supported;
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-
-    // Setup event handler
-    let mut event_handler = EventHandler::new();
-    event_handler.spawn_keyboard_listener();
-    event_handler.spawn_tick_timer(Duration::from_millis(250));
-
-    // Start polling service
-    let (polling_service, polling_cmd_sender) = backend::PollingService::new(
-        app.config.server_url.clone(),
-        app.keypair.encrypt_sk.clone(),
-        app.keypair.sign_pk.clone(),
-        event_handler.sender(),
-    );
-    polling_service.start();
-
-    // Give app access to polling command sender
-    app.set_polling_sender(polling_cmd_sender);
 
     // Main event loop
     let result = run_app(&mut terminal, &mut app, &mut event_handler).await;
@@ -101,22 +102,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         logger::log_to_file(&format!("Error: {:?}", err));
     }
 
-    // Remove TUI running flag so daemon knows TUI has exited
-    remove_tui_running_flag();
-
     Ok(())
-}
-
-fn write_tui_running_flag() {
-    if let Ok(dir) = storage::get_app_data_dir() {
-        let _ = std::fs::write(dir.join("tui.running"), "1");
-    }
-}
-
-fn remove_tui_running_flag() {
-    if let Ok(dir) = storage::get_app_data_dir() {
-        let _ = std::fs::remove_file(dir.join("tui.running"));
-    }
 }
 
 async fn run_app(
@@ -125,6 +111,11 @@ async fn run_app(
     event_handler: &mut EventHandler,
 ) -> io::Result<()> {
     loop {
+        // Drain any pending daemon responses (LoadMessages, LoadPeers, etc.)
+        for ev in app.drain_daemon_events() {
+            app.handle_daemon_event(ev);
+        }
+
         // Draw UI
         terminal.draw(|f| {
             render_ui(f, app);
@@ -135,7 +126,6 @@ async fn run_app(
             app.handle_event(event);
         }
 
-        // Check if should quit
         if app.should_quit {
             break;
         }
@@ -149,14 +139,11 @@ fn render_ui(f: &mut ratatui::Frame, app: &App) {
         layout::{Constraint, Direction, Layout},
     };
 
-    // Calculate input area height dynamically based on content
     let terminal_width = f.area().width as usize;
     let input_height = if app.show_slash_menu && app.menu_state == app::MenuState::Closed {
-        // Slash menu: commands + separator + input line
         let commands = app.get_filtered_slash_commands();
         (commands.len() + 2) as u16
     } else {
-        // Count rendered lines in the current input ("> " prefix = 2 chars)
         let content_width = terminal_width.saturating_sub(2).max(1);
         let input_text = match app.menu_state {
             app::MenuState::ImportContact => &app.contact_import_input,
@@ -167,24 +154,22 @@ fn render_ui(f: &mut ratatui::Frame, app: &App) {
             let chars = seg.chars().count();
             ((chars + content_width - 1) / content_width).max(1) as u16
         }).sum();
-        let text_lines = text_lines.max(2); // minimum 2 text lines
-        let max_input = f.area().height / 3; // cap at 1/3 of screen
-        (text_lines + 2).min(max_input) // +2 for top and bottom separators
+        let text_lines = text_lines.max(2);
+        let max_input = f.area().height / 3;
+        (text_lines + 2).min(max_input)
     };
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(0),              // Main content (fills remaining space)
-            Constraint::Length(input_height), // Input area (dynamic height)
-            Constraint::Length(2),           // Hints (2 lines of text)
+            Constraint::Min(0),
+            Constraint::Length(input_height),
+            Constraint::Length(2),
         ])
         .split(f.area());
 
-    // Render different views based on state
     match app.menu_state {
         app::MenuState::Closed => {
-            // Normal chat view
             ui::render_message_list(f, app, chunks[0]);
             ui::render_input_area(f, app, chunks[1]);
         }
@@ -206,6 +191,5 @@ fn render_ui(f: &mut ratatui::Frame, app: &App) {
         }
     }
 
-    // Hints (always at bottom)
     ui::render_hints(f, app, chunks[2]);
 }

@@ -2,7 +2,8 @@
 //
 // Architecture:
 //   main thread: tray icon + event loop (required by macOS)
-//   tokio thread: background polling every 60s
+//   ipc thread:  local socket listener (one TUI connection at a time)
+//   tokio thread: background polling (adaptive when TUI connected, 60s when not)
 
 // Hide the console window on Windows so only the tray icon appears
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
@@ -20,12 +21,12 @@ use tray_icon::{
 };
 
 mod polling;
+mod ipc;
 
 /// Shared state between polling thread and main thread
 #[derive(Default)]
 struct DaemonState {
     unread_count: usize,
-    tui_running: bool,
 }
 
 fn main() {
@@ -53,17 +54,41 @@ fn main() {
         }
     }
 
-    // Shared daemon state (unread count, tui running flag)
+    // Shared daemon state (unread count)
     let state = Arc::new(Mutex::new(DaemonState::default()));
 
-    // Channel from polling thread to main thread
+    // Channel from polling thread to main thread (unread count updates)
     let (tx, rx) = std::sync::mpsc::channel::<polling::DaemonEvent>();
+
+    // IPC signal channel (IPC → polling thread)
+    let (ipc_signal_tx, ipc_signal_rx) = tokio::sync::mpsc::unbounded_channel::<ipc::IpcSignal>();
+
+    // Load server URL for IPC state
+    let server_url = trassenger_lib::storage::load_config()
+        .map(|c| c.server_url)
+        .unwrap_or_else(|_| trassenger_lib::config::DEFAULT_SERVER_URL.to_string());
+
+    // Shared IPC state (keypair set by polling thread after it loads it)
+    let ipc_state = Arc::new(Mutex::new(ipc::IpcState {
+        keypair: None,
+        server_url,
+        signal_tx: ipc_signal_tx,
+        current_interval_secs: 60,
+    }));
+
+    // Shared sender slot for pushing events to connected TUI
+    let tui_sender: ipc::TuiEventSender = Arc::new(Mutex::new(None));
+
+    // Start IPC listener (socket)
+    ipc::start_ipc_listener(ipc_state.clone(), tui_sender.clone());
 
     // Spawn tokio polling thread
     let state_clone = state.clone();
     let tx_clone = tx.clone();
+    let ipc_state_clone = ipc_state.clone();
+    let tui_sender_clone = tui_sender.clone();
     std::thread::spawn(move || {
-        polling::run_polling(state_clone, tx_clone);
+        polling::run_polling(state_clone, tx_clone, ipc_state_clone, ipc_signal_rx, tui_sender_clone);
     });
 
     // Build tray menu
@@ -103,8 +128,6 @@ fn main() {
     // the tray icon actually appears in the menu bar.
     let event_loop = EventLoopBuilder::new().build();
 
-    // The tray icon must be created AFTER the event loop on macOS.
-    // Move creation inside so it's owned by the closure.
     let _tray_icon = tray_icon; // keep alive
 
     event_loop.run(move |_event, _, control_flow| {
@@ -127,18 +150,16 @@ fn main() {
                         let _ = _tray_icon.set_tooltip(Some("Trassenger".to_string()));
                     }
                 }
-                polling::DaemonEvent::TuiOpened => {
-                    if let Ok(mut s) = state.lock() {
-                        s.unread_count = 0;
-                        s.tui_running = true;
-                    }
+            }
+        }
+
+        // Reset unread badge when TUI is connected
+        if ipc::is_tui_connected(&tui_sender) {
+            if let Ok(mut s) = state.lock() {
+                if s.unread_count > 0 {
+                    s.unread_count = 0;
                     let _ = _tray_icon.set_icon(Some(icon_normal.clone()));
                     let _ = _tray_icon.set_tooltip(Some("Trassenger".to_string()));
-                }
-                polling::DaemonEvent::TuiClosed => {
-                    if let Ok(mut s) = state.lock() {
-                        s.tui_running = false;
-                    }
                 }
             }
         }
@@ -162,7 +183,7 @@ fn main() {
 // ── Icon loading ──────────────────────────────────────────────────────────────
 
 fn load_icon(png_bytes: &[u8]) -> Icon {
-    let img = image_from_png(png_bytes);
+    let img = decode_png_to_rgba(png_bytes);
     Icon::from_rgba(img.data, img.width, img.height)
         .expect("Failed to create icon from PNG")
 }
@@ -173,26 +194,10 @@ struct RgbaImage {
     height: u32,
 }
 
-fn image_from_png(bytes: &[u8]) -> RgbaImage {
-    // Minimal PNG decoder using the `png` feature; we use a hand-rolled approach
-    // by depending on the `image` crate via tray-icon's dependencies.
-    // Actually we'll use a simple raw decode using the png crate indirectly.
-    // tray-icon uses image crate, so we replicate what it needs: raw RGBA bytes.
-    // We use a lightweight inline PNG decode here.
-    decode_png_to_rgba(bytes)
-}
-
 fn decode_png_to_rgba(png_bytes: &[u8]) -> RgbaImage {
-    // Use minipng / hand-decode. Since we generated the PNGs ourselves with
-    // known format (RGB, 22x22), we decode them manually.
-    // PNG structure: sig(8) + IHDR(25) + IDAT(var) + IEND(12)
-    // We'll use a simple approach: find IHDR for dimensions, then decompress IDAT.
-
     use std::io::Read;
 
-    // Skip PNG signature (8 bytes)
     let mut pos = 8usize;
-
     let mut width = 0u32;
     let mut height = 0u32;
     let mut idat_data = Vec::new();
@@ -216,21 +221,19 @@ fn decode_png_to_rgba(png_bytes: &[u8]) -> RgbaImage {
         }
     }
 
-    // Decompress IDAT
     let mut decoder = flate2::read::ZlibDecoder::new(&idat_data[..]);
     let mut raw = Vec::new();
     decoder.read_to_end(&mut raw).expect("Failed to decompress PNG");
 
-    // Convert filtered RGB scanlines to RGBA
     let mut rgba = Vec::with_capacity((width * height * 4) as usize);
-    let stride = 1 + width as usize * 3; // filter byte + RGB pixels
+    let stride = 1 + width as usize * 3;
     for y in 0..height as usize {
-        let row = &raw[y * stride + 1..(y + 1) * stride]; // skip filter byte
+        let row = &raw[y * stride + 1..(y + 1) * stride];
         for x in 0..width as usize {
-            rgba.push(row[x * 3]);     // R
-            rgba.push(row[x * 3 + 1]); // G
-            rgba.push(row[x * 3 + 2]); // B
-            rgba.push(255);             // A
+            rgba.push(row[x * 3]);
+            rgba.push(row[x * 3 + 1]);
+            rgba.push(row[x * 3 + 2]);
+            rgba.push(255);
         }
     }
 
@@ -242,8 +245,7 @@ fn decode_png_to_rgba(png_bytes: &[u8]) -> RgbaImage {
 fn tui_path() -> String {
     let exe = std::env::current_exe().unwrap_or_default();
     let dir = exe.parent().unwrap_or(std::path::Path::new("."));
-    let tui = dir.join("trassenger-tui");
-    tui.to_string_lossy().to_string()
+    dir.join("trassenger-tui").to_string_lossy().to_string()
 }
 
 fn launch_tui() {
@@ -254,9 +256,6 @@ fn launch_tui() {
 
     #[cfg(target_os = "windows")]
     {
-        // Try Windows Terminal first, fall back to cmd /c start
-        // Note: `start` interprets the first quoted arg as window title,
-        // so pass `""` as title then the path as the program.
         if Command::new("wt.exe")
             .args(["--title", "Trassenger", "--", &tui])
             .spawn()
@@ -280,12 +279,6 @@ fn launch_tui() {
 
 #[cfg(target_os = "macos")]
 fn app_installed(name: &str) -> bool {
-    // Use mdfind to check if the app bundle actually exists on disk
-    Command::new("mdfind")
-        .args(["kMDItemCFBundleIdentifier", "-onlyin", "/Applications"])
-        .output()
-        .ok();
-    // Check /Applications and ~/Applications directly
     let home = std::env::var("HOME").unwrap_or_default();
     let candidates = [
         format!("/Applications/{}.app", name),
@@ -296,12 +289,10 @@ fn app_installed(name: &str) -> bool {
 
 #[cfg(target_os = "macos")]
 fn launch_tui_macos(tui: &str) {
-    // Warp: open with --args (it accepts a command to run)
     if app_installed("Warp") {
         let _ = Command::new("open").args(["-a", "Warp", "--args", tui]).spawn();
         return;
     }
-    // iTerm2: AppleScript
     if app_installed("iTerm") {
         let script = format!(
             "tell application \"iTerm2\"\n\
@@ -321,17 +312,14 @@ fn launch_tui_macos(tui: &str) {
             .spawn();
         return;
     }
-    // Alacritty: -e flag
     if app_installed("Alacritty") {
         let _ = Command::new("open").args(["-a", "Alacritty", "--args", "-e", tui]).spawn();
         return;
     }
-    // kitty: command line
     if let Ok(kitty) = which_app("kitty") {
         let _ = Command::new(kitty).args([tui]).spawn();
         return;
     }
-    // Terminal.app fallback
     let script = format!("tell application \"Terminal\" to do script \"{}\"", tui);
     let _ = Command::new("osascript").args(["-e", &script]).spawn();
 }
@@ -394,14 +382,12 @@ fn is_already_running() -> bool {
     if pid == 0 {
         return false;
     }
-    // Check if process is alive
     #[cfg(unix)]
     {
         unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
     }
     #[cfg(windows)]
     {
-        // Use tasklist to check if PID is alive (no extra crate needed)
         Command::new("tasklist")
             .args(["/FI", &format!("PID eq {}", pid), "/NH"])
             .output()

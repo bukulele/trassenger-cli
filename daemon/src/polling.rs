@@ -1,31 +1,69 @@
 // Background polling for the daemon
-// Polls all conversation queues every 60s, sends notifications on new messages.
+// Polls all conversation queues, adaptive interval based on TUI connection.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use trassenger_lib::{crypto, crypto::Keypair, mailbox::MailboxClient, storage};
 use crate::DaemonState;
+use crate::ipc::{IpcSignal, IpcState, TuiEventSender};
 
-/// Events sent from the polling thread to the main thread
+// ── Adaptive interval ────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct AdaptiveInterval {
+    current_secs: u64,
+    min_secs: u64,
+    max_secs: u64,
+}
+
+impl AdaptiveInterval {
+    pub fn new(min_secs: u64, max_secs: u64) -> Self {
+        Self { current_secs: min_secs, min_secs, max_secs }
+    }
+
+    pub fn reset(&mut self) {
+        self.current_secs = self.min_secs;
+    }
+
+    pub fn increase(&mut self) {
+        self.current_secs = (self.current_secs * 2).min(self.max_secs);
+    }
+
+    pub fn get(&self) -> u64 {
+        self.current_secs
+    }
+}
+
+// ── Events sent from the polling thread to the main thread ───────────────────
+
 pub enum DaemonEvent {
     /// New unread count
     UnreadCount(usize),
-    /// TUI process was detected as opened
-    TuiOpened,
-    /// TUI process was detected as closed
-    TuiClosed,
 }
 
+// ── Main polling loop ────────────────────────────────────────────────────────
+
 /// Main polling loop (runs in a dedicated thread with its own tokio runtime)
-pub fn run_polling(state: Arc<Mutex<DaemonState>>, tx: std::sync::mpsc::Sender<DaemonEvent>) {
+pub fn run_polling(
+    _state: Arc<Mutex<DaemonState>>,
+    tx: std::sync::mpsc::Sender<DaemonEvent>,
+    ipc_state: Arc<Mutex<IpcState>>,
+    signal_rx: tokio::sync::mpsc::UnboundedReceiver<IpcSignal>,
+    tui_sender: TuiEventSender,
+) {
     let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
     rt.block_on(async move {
-        polling_loop(state, tx).await;
+        polling_loop(tx, ipc_state, signal_rx, tui_sender).await;
     });
 }
 
-async fn polling_loop(_state: Arc<Mutex<DaemonState>>, tx: std::sync::mpsc::Sender<DaemonEvent>) {
+async fn polling_loop(
+    tx: std::sync::mpsc::Sender<DaemonEvent>,
+    ipc_state: Arc<Mutex<IpcState>>,
+    mut signal_rx: tokio::sync::mpsc::UnboundedReceiver<IpcSignal>,
+    tui_sender: TuiEventSender,
+) {
     // Load keypair
     let keypair = match storage::load_keypair() {
         Ok(kp) => kp,
@@ -35,50 +73,85 @@ async fn polling_loop(_state: Arc<Mutex<DaemonState>>, tx: std::sync::mpsc::Send
         }
     };
 
+    // Store keypair in IPC state so handlers can use it
+    if let Ok(mut s) = ipc_state.lock() {
+        s.keypair = Some(keypair.clone());
+    }
+
     let config = storage::load_config().unwrap_or_else(|_| storage::Config {
         server_url: trassenger_lib::config::DEFAULT_SERVER_URL.to_string(),
         polling_interval_secs: 60,
     });
 
     let client = MailboxClient::new(config.server_url.clone());
-    let mut tui_was_running = false;
+
+    // When TUI is connected: fast adaptive polling (5s → 60s)
+    // When TUI is not connected: slow fixed polling (60s)
+    let mut tui_connected = false;
+    let mut fast_interval = AdaptiveInterval::new(5, 60);
+    let slow_interval = 60u64;
     let mut unread: usize = 0;
 
     loop {
-        // Check TUI running flag file
-        let tui_running = tui_running_flag_exists();
-        if tui_running && !tui_was_running {
-            tui_was_running = true;
-            unread = 0;
-            let _ = tx.send(DaemonEvent::TuiOpened);
-        } else if !tui_running && tui_was_running {
-            tui_was_running = false;
-            let _ = tx.send(DaemonEvent::TuiClosed);
-        }
+        // Poll queues — daemon owns all network I/O
+        let new_msgs = poll_all_queues(&client, &keypair, &tui_sender).await;
 
-        // Poll all queues only when TUI is not running — TUI handles its own polling
-        let new_msgs = if !tui_running {
-            poll_all_queues(&client, &keypair).await
+        if tui_connected {
+            if new_msgs > 0 {
+                fast_interval.reset();
+            } else {
+                fast_interval.increase();
+            }
+            crate::ipc::push_polling_interval(&tui_sender, fast_interval.get());
         } else {
-            0
-        };
-        if new_msgs > 0 {
-            unread += new_msgs;
-            let _ = tx.send(DaemonEvent::UnreadCount(unread));
-            send_notification(new_msgs);
-        }
-        if tui_running && unread > 0 {
-            unread = 0;
-            let _ = tx.send(DaemonEvent::UnreadCount(0));
+            if new_msgs > 0 {
+                unread += new_msgs;
+                let _ = tx.send(DaemonEvent::UnreadCount(unread));
+                send_notification(new_msgs);
+            }
         }
 
-        tokio::time::sleep(Duration::from_secs(60)).await;
+        let sleep_secs = if tui_connected { fast_interval.get() } else { slow_interval };
+
+        // Sleep for the interval, but wake immediately on any IPC signal
+        let sleep = tokio::time::sleep(Duration::from_secs(sleep_secs));
+        tokio::pin!(sleep);
+        loop {
+            tokio::select! {
+                _ = &mut sleep => break,
+                signal = signal_rx.recv() => {
+                    match signal {
+                        Some(IpcSignal::TuiConnected) => {
+                            tui_connected = true;
+                            unread = 0;
+                            fast_interval.reset();
+                            eprintln!("[daemon] TUI connected — switching to fast polling");
+                            crate::ipc::push_polling_interval(&tui_sender, fast_interval.get());
+                            let _ = tx.send(DaemonEvent::UnreadCount(0));
+                            break; // Poll immediately
+                        }
+                        Some(IpcSignal::TuiDisconnected) => {
+                            tui_connected = false;
+                            eprintln!("[daemon] TUI disconnected — returning to slow polling");
+                            break; // Poll immediately
+                        }
+                        Some(IpcSignal::ResetPollingInterval) => {
+                            fast_interval.reset();
+                            crate::ipc::push_polling_interval(&tui_sender, fast_interval.get());
+                            break; // Poll immediately
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
     }
 }
 
 async fn poll_all_queues(
     client: &MailboxClient,
     keypair: &Keypair,
+    tui_sender: &TuiEventSender,
 ) -> usize {
     let peers = match storage::load_peers() {
         Ok(p) => p,
@@ -87,7 +160,7 @@ async fn poll_all_queues(
 
     let mut total = 0;
     for peer in &peers {
-        match poll_queue(client, keypair, &peer.queue_id).await {
+        match poll_queue(client, keypair, &peer.queue_id, tui_sender).await {
             Ok(count) => total += count,
             Err(e) => eprintln!("[daemon] Poll error for {}: {}", peer.queue_id, e),
         }
@@ -99,6 +172,7 @@ async fn poll_queue(
     client: &MailboxClient,
     keypair: &Keypair,
     queue_id: &str,
+    tui_sender: &TuiEventSender,
 ) -> Result<usize, String> {
     let messages = client.fetch_messages(queue_id).await?;
     if messages.is_empty() {
@@ -109,21 +183,27 @@ async fn poll_queue(
     for msg in &messages {
         match process_message(msg, queue_id, keypair) {
             Ok(message) => {
-                if let Ok(conn) = storage::init_message_db() {
-                    let _ = storage::save_message(&conn, &message);
+                let saved = storage::init_message_db()
+                    .and_then(|conn| storage::save_message(&conn, &message))
+                    .is_ok();
+                if saved {
+                    count += 1;
+                    // Push to TUI if connected
+                    crate::ipc::push_new_message(tui_sender, message);
+                    // Only delete from server after successfully saving locally
+                    let _ = client.delete_message(queue_id, &msg.id).await;
+                } else {
+                    eprintln!("[daemon] Failed to save message {}, keeping on server for retry", msg.id);
                 }
-                count += 1;
-                // Delete from server
-                let _ = client.delete_message(queue_id, &msg.id).await;
             }
             Err(e) if e.contains("Skipping own message") => {
-                // Don't delete own messages - TUI recipient needs them
+                // Don't delete own messages - the other side needs to fetch them
             }
             Err(e) => {
+                // Log and skip — keep message on server for retry
+                // Never delete on crypto failure: could be a transient error or
+                // the message was not meant for us.
                 eprintln!("[daemon] Failed to process {}: {}", msg.id, e);
-                if e.contains("Decryption failed") || e.contains("Signature verification failed") {
-                    let _ = client.delete_message(queue_id, &msg.id).await;
-                }
             }
         }
     }
@@ -184,13 +264,6 @@ fn process_message(
     })
 }
 
-fn tui_running_flag_exists() -> bool {
-    let path = storage::get_app_data_dir()
-        .unwrap_or_default()
-        .join("tui.running");
-    path.exists()
-}
-
 fn send_notification(count: usize) {
     let body = if count == 1 {
         "You have 1 new message".to_string()
@@ -198,20 +271,12 @@ fn send_notification(count: usize) {
         format!("You have {} new messages", count)
     };
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     {
         let _ = notify_rust::Notification::new()
             .summary("Trassenger")
             .body(&body)
-            .show();
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        // Windows toast notifications via notify-rust
-        let _ = notify_rust::Notification::new()
-            .summary("Trassenger")
-            .body(&body)
+            .sound_name("default")
             .show();
     }
 }

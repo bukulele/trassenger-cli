@@ -1,141 +1,97 @@
-use crate::crypto::Keypair;
-use crate::event::AppEvent;
+use crate::ipc::{DaemonClient, DaemonEvent};
 use crate::storage::{Config, Message, Peer};
-use crate::{config, crypto, storage};
+use crate::event::AppEvent;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use rusqlite::Connection;
 
 /// Command/view state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuState {
-    Closed,          // Normal chat view
-    Contacts,        // Viewing contacts list
-    ImportContact,   // Importing a contact
-    ExportContact,   // Exporting contact info
-    Settings,        // Settings view
+    Closed,
+    Contacts,
+    ImportContact,
+    ExportContact,
+    Settings,
 }
 
 /// Input mode for text editing
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputMode {
-    /// Normal mode - navigation with keyboard
     Normal,
-    /// Editing mode - typing text
     Editing,
 }
 
 /// Main application state
 pub struct App {
-    /// User's keypair (encryption + signing)
-    pub keypair: Keypair,
-    /// Application configuration
+    /// Connection to daemon
+    daemon: DaemonClient,
+
+    /// Application configuration (cached locally for display)
     pub config: Config,
     /// List of contacts/peers
     pub peers: Vec<Peer>,
     /// Messages for current conversation
     pub messages: Vec<Message>,
-    /// Database connection
-    pub db_conn: Connection,
 
     // Navigation state
-    /// Menu overlay state
     pub menu_state: MenuState,
-    /// Input mode
     pub input_mode: InputMode,
-    /// Selected peer index
     pub selected_peer_index: usize,
 
     // Message input
-    /// Current message being typed
     pub message_input: String,
-    /// Cursor position in the active input (char index)
     pub input_cursor: usize,
-    /// Slash command menu state
     pub show_slash_menu: bool,
-    /// Selected command in slash menu
     pub slash_menu_index: usize,
 
     // Contact import/export
-    /// Contact JSON input (for import)
     pub contact_import_input: String,
-    /// Contact name input (for export)
     pub contact_export_name: String,
-    /// Exported contact JSON
     pub contact_export_json: String,
 
-    // Settings
-    /// Currently editing settings field
+    // Settings (cached for display)
     pub settings_selected_field: usize,
-    /// Server URL input
     pub settings_server_url: String,
-    /// Polling interval input
     pub settings_polling_interval: String,
-    /// Daemon autostart enabled state (cached for display)
     pub settings_autostart_enabled: bool,
 
     // Status
-    /// Status message to display
     pub status_message: String,
-    /// Current polling interval (for adaptive polling)
     pub current_polling_interval: u64,
 
-    /// Chat scroll offset (0 = at bottom, higher = scrolled up)
     pub chat_scroll_offset: usize,
-
-    /// Should the app quit
     pub should_quit: bool,
 
-    /// Sender for polling commands
-    polling_sender: Option<tokio::sync::mpsc::UnboundedSender<crate::backend::PollingCommand>>,
-
-    /// Whether keyboard enhancements are supported (for Shift+Enter)
     pub keyboard_enhancements_supported: bool,
 }
 
 impl App {
-    /// Initialize the application
-    pub fn initialize() -> Result<Self, String> {
-        // Initialize crypto
-        crypto::init()?;
-
-        // Initialize storage directories
-        storage::init_storage()?;
-
-        // Load or generate keypair
-        let keypair = match storage::load_keypair() {
-            Ok(kp) => kp,
-            Err(_) => {
-                let kp = crypto::generate_keypair();
-                storage::save_keypair(&kp)?;
-                kp
-            }
-        };
-
-        // Load or create config
-        let config = match storage::load_config() {
-            Ok(cfg) => cfg,
-            Err(_) => {
-                let cfg = Config {
-                    server_url: config::DEFAULT_SERVER_URL.to_string(),
-                    polling_interval_secs: config::DEFAULT_POLLING_INTERVAL,
-                };
-                storage::save_config(&cfg)?;
-                cfg
-            }
-        };
-
+    /// Initialize the application by loading state from daemon
+    pub async fn initialize(mut daemon: DaemonClient) -> Result<Self, String> {
         // Load peers
-        let peers = storage::load_peers().unwrap_or_default();
+        daemon.load_peers();
+        let peers = loop {
+            match daemon.try_recv_all().into_iter().find_map(|ev| {
+                if let DaemonEvent::Peers { peers } = ev { Some(peers) } else { None }
+            }) {
+                Some(p) => break p,
+                None => {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    daemon.load_peers();
+                }
+            }
+        };
 
-        // Initialize database
-        let db_conn = storage::init_message_db()?;
+        // Load config (from disk directly - TUI still reads config for display)
+        let config = crate::storage::load_config().unwrap_or_else(|_| Config {
+            server_url: crate::config::DEFAULT_SERVER_URL.to_string(),
+            polling_interval_secs: crate::config::DEFAULT_POLLING_INTERVAL,
+        });
 
         let mut app = Self {
-            keypair,
+            daemon,
             config: config.clone(),
             peers,
             messages: Vec::new(),
-            db_conn,
 
             menu_state: MenuState::Closed,
             input_mode: InputMode::Normal,
@@ -160,11 +116,10 @@ impl App {
 
             chat_scroll_offset: 0,
             should_quit: false,
-            polling_sender: None,
-            keyboard_enhancements_supported: false, // Will be set by main.rs
+            keyboard_enhancements_supported: false,
         };
 
-        // Load messages for the first peer if available
+        // Load messages for first peer
         if !app.peers.is_empty() {
             app.load_messages_for_selected_peer();
         }
@@ -172,13 +127,72 @@ impl App {
         Ok(app)
     }
 
-    /// Handle incoming events
+    /// Drain pending daemon response events (called every frame before rendering)
+    pub fn drain_daemon_events(&mut self) -> Vec<DaemonEvent> {
+        self.daemon.try_recv_all()
+    }
+
+    /// Handle a daemon event received between frames
+    pub fn handle_daemon_event(&mut self, ev: DaemonEvent) {
+        match ev {
+            DaemonEvent::Messages { queue_id, messages } => {
+                if let Some(peer) = self.peers.get(self.selected_peer_index) {
+                    if peer.queue_id == queue_id {
+                        self.messages = messages;
+                    }
+                }
+            }
+            DaemonEvent::Peers { peers } => {
+                self.peers = peers;
+            }
+            DaemonEvent::ContactImported { peer } => {
+                if !self.peers.iter().any(|p| p.encrypt_pk == peer.encrypt_pk) {
+                    self.peers.push(peer.clone());
+                }
+                self.status_message = format!("Contact '{}' imported", peer.name);
+                self.contact_import_input.clear();
+                self.menu_state = MenuState::Closed;
+                self.input_mode = InputMode::Normal;
+            }
+            DaemonEvent::ContactExported { json } => {
+                self.contact_export_json = json;
+                let name = self.contact_export_name.trim().replace(' ', "-");
+                self.status_message = format!("Saved to Downloads: contact-{}.json", name);
+                self.input_mode = InputMode::Normal;
+            }
+            DaemonEvent::MessageSent => {
+                self.load_messages_for_selected_peer();
+            }
+            DaemonEvent::PollingInterval { secs } => {
+                self.current_polling_interval = secs;
+            }
+            DaemonEvent::Error { message } => {
+                self.status_message = format!("Error: {}", message);
+                self.input_mode = InputMode::Normal;
+            }
+            DaemonEvent::NewMessage { message } => {
+                // Reload if we're viewing this conversation
+                if let Some(peer) = self.peers.get(self.selected_peer_index) {
+                    if peer.queue_id == message.queue_id {
+                        self.load_messages_for_selected_peer();
+                    }
+                }
+                self.status_message = format!("← {}", message.sender);
+            }
+        }
+    }
+
+    /// Handle incoming AppEvents
     pub fn handle_event(&mut self, event: AppEvent) {
         match event {
             AppEvent::Key(key) => self.handle_key(key),
-            AppEvent::NewMessage(message) => self.handle_new_message(message),
-            AppEvent::Tick => {
-                self.load_messages_for_selected_peer();
+            AppEvent::NewMessage(message) => {
+                if let Some(peer) = self.peers.get(self.selected_peer_index) {
+                    if peer.queue_id == message.queue_id {
+                        self.load_messages_for_selected_peer();
+                    }
+                }
+                self.status_message = format!("← {}", message.sender);
             }
             AppEvent::PollingIntervalUpdate(interval) => {
                 self.current_polling_interval = interval;
@@ -187,80 +201,50 @@ impl App {
         }
     }
 
-    /// Handle paste event (drag-and-drop or cmd+v)
     fn handle_paste(&mut self, text: String) {
-        // If we're in import mode and text looks like a file path, import it
         if self.menu_state == MenuState::ImportContact {
             let trimmed = text.trim();
-
-            // Check if it looks like a file path (has .json extension or starts with file://)
             if trimmed.ends_with(".json") || trimmed.starts_with("file://") {
-                // Clean up file:// prefix if present
-                let path = if trimmed.starts_with("file://") {
-                    trimmed.trim_start_matches("file://")
-                } else {
-                    trimmed
-                };
-
+                let path = trimmed.trim_start_matches("file://");
                 self.contact_import_input = path.to_string();
                 self.status_message = "File path pasted - press Enter to import".to_string();
             } else {
-                // Assume it's JSON content
                 self.contact_import_input = text;
                 self.status_message = "JSON pasted - press Enter to import".to_string();
             }
         } else {
-            // In other modes, just append to current input
             match self.menu_state {
-                MenuState::ExportContact => {
-                    self.contact_export_name.push_str(&text);
-                }
-                _ => {
-                    self.message_input.push_str(&text);
-                }
+                MenuState::ExportContact => { self.contact_export_name.push_str(&text); }
+                _ => { self.message_input.push_str(&text); }
             }
         }
     }
 
-    /// Handle keyboard input
     fn handle_key(&mut self, key: KeyEvent) {
-        // Global shortcuts (work in any mode)
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('c') | KeyCode::Char('q') => {
                     self.should_quit = true;
                     return;
                 }
-                KeyCode::Char('p') => {
-                    self.handle_up();
-                    return;
-                }
-                KeyCode::Char('n') => {
-                    self.handle_down();
-                    return;
-                }
+                KeyCode::Char('p') => { self.handle_up(); return; }
+                KeyCode::Char('n') => { self.handle_down(); return; }
                 _ => {}
             }
         }
 
-        // Mode-specific handling
         match self.input_mode {
             InputMode::Normal => self.handle_key_normal(key),
             InputMode::Editing => self.handle_key_editing(key),
         }
     }
 
-    /// Handle keyboard input in Normal mode (navigation)
     fn handle_key_normal(&mut self, key: KeyEvent) {
-        // Handle view/command state
         match key.code {
-            // Escape - always go back to chat
             KeyCode::Esc => {
                 self.menu_state = MenuState::Closed;
-                self.status_message = "".to_string();
+                self.status_message.clear();
             }
-
-            // Slash commands (like Claude Code)
             KeyCode::Char('/') => {
                 self.input_mode = InputMode::Editing;
                 self.message_input.push('/');
@@ -268,27 +252,15 @@ impl App {
                 self.show_slash_menu = true;
                 self.slash_menu_index = 0;
             }
-
-            // Navigation: contacts view = switch peer, chat view = scroll, settings = field select
-            KeyCode::Up if self.menu_state == MenuState::Contacts => {
-                self.handle_up();
-            }
-            KeyCode::Down if self.menu_state == MenuState::Contacts => {
-                self.handle_down();
-            }
+            KeyCode::Up if self.menu_state == MenuState::Contacts => self.handle_up(),
+            KeyCode::Down if self.menu_state == MenuState::Contacts => self.handle_down(),
             KeyCode::Up if self.menu_state == MenuState::Settings => {
-                if self.settings_selected_field > 0 {
-                    self.settings_selected_field -= 1;
-                }
+                if self.settings_selected_field > 0 { self.settings_selected_field -= 1; }
             }
             KeyCode::Down if self.menu_state == MenuState::Settings => {
-                if self.settings_selected_field < 2 {
-                    self.settings_selected_field += 1;
-                }
+                if self.settings_selected_field < 2 { self.settings_selected_field += 1; }
             }
-            KeyCode::Enter if self.menu_state == MenuState::Settings => {
-                self.submit_settings();
-            }
+            KeyCode::Enter if self.menu_state == MenuState::Settings => self.submit_settings(),
             KeyCode::Up if self.menu_state == MenuState::Closed => {
                 self.chat_scroll_offset = self.chat_scroll_offset.saturating_add(1);
             }
@@ -296,14 +268,11 @@ impl App {
                 self.chat_scroll_offset = self.chat_scroll_offset.saturating_sub(1);
             }
             KeyCode::Enter if self.menu_state == MenuState::Contacts => {
-                // Select contact and return to chat
                 if !self.peers.is_empty() && self.selected_peer_index < self.peers.len() {
                     self.menu_state = MenuState::Closed;
                     self.load_messages_for_selected_peer();
                 }
             }
-
-            // Start typing (only in chat view with contacts)
             KeyCode::Char(c) if self.menu_state == MenuState::Closed => {
                 if !self.peers.is_empty() {
                     self.input_mode = InputMode::Editing;
@@ -312,21 +281,18 @@ impl App {
                     self.status_message = "No contacts - type /import to add one".to_string();
                 }
             }
-
             _ => {}
         }
     }
 
-    /// Handle keyboard input in Editing mode
     fn handle_key_editing(&mut self, key: KeyEvent) {
-        // Special handling when slash menu is open
         if self.show_slash_menu && self.menu_state == MenuState::Closed {
             match key.code {
                 KeyCode::Esc => {
                     self.input_mode = InputMode::Normal;
                     self.clear_message_input();
                     self.show_slash_menu = false;
-                    self.status_message = "".to_string();
+                    self.status_message.clear();
                 }
                 KeyCode::Up => {
                     let commands = self.get_filtered_slash_commands();
@@ -364,20 +330,17 @@ impl App {
             return;
         }
 
-        // Normal editing mode
         match key.code {
             KeyCode::Esc => {
                 self.input_mode = InputMode::Normal;
                 self.message_input.clear();
                 self.input_cursor = 0;
                 self.show_slash_menu = false;
-                self.status_message = "".to_string();
+                self.status_message.clear();
             }
-
             KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.handle_char_input('\n');
             }
-
             KeyCode::Enter => {
                 if key.modifiers.contains(KeyModifiers::SHIFT) {
                     self.handle_char_input('\n');
@@ -385,73 +348,43 @@ impl App {
                     self.handle_submit();
                 }
             }
-
-            KeyCode::Backspace => {
-                self.handle_backspace();
+            KeyCode::Backspace => self.handle_backspace(),
+            KeyCode::Delete => self.handle_delete(),
+            KeyCode::Left if self.menu_state == MenuState::Closed => {
+                self.input_cursor = self.input_cursor.saturating_sub(1);
             }
-
-            KeyCode::Delete => {
-                self.handle_delete();
+            KeyCode::Right if self.menu_state == MenuState::Closed => {
+                let max = self.message_input.chars().count();
+                if self.input_cursor < max { self.input_cursor += 1; }
             }
-
-            KeyCode::Left => {
-                if self.menu_state == MenuState::Closed {
-                    self.input_cursor = self.input_cursor.saturating_sub(1);
-                }
+            KeyCode::Home if self.menu_state == MenuState::Closed => {
+                self.input_cursor = 0;
             }
-
-            KeyCode::Right => {
-                if self.menu_state == MenuState::Closed {
-                    let max = self.message_input.chars().count();
-                    if self.input_cursor < max {
-                        self.input_cursor += 1;
-                    }
-                }
+            KeyCode::End if self.menu_state == MenuState::Closed => {
+                self.input_cursor = self.message_input.chars().count();
             }
-
-            KeyCode::Home => {
-                if self.menu_state == MenuState::Closed {
-                    self.input_cursor = 0;
-                }
-            }
-
-            KeyCode::End => {
-                if self.menu_state == MenuState::Closed {
-                    self.input_cursor = self.message_input.chars().count();
-                }
-            }
-
-            KeyCode::Char(c) => {
-                self.handle_char_input(c);
-            }
-
+            KeyCode::Char(c) => self.handle_char_input(c),
             _ => {}
         }
     }
 
-    /// Handle Up arrow key
     fn handle_up(&mut self) {
-        // Navigate peer list
         if self.selected_peer_index > 0 {
             self.selected_peer_index -= 1;
             self.load_messages_for_selected_peer();
         }
     }
 
-    /// Handle Down arrow key
     fn handle_down(&mut self) {
-        // Navigate peer list
         if !self.peers.is_empty() && self.selected_peer_index < self.peers.len() - 1 {
             self.selected_peer_index += 1;
             self.load_messages_for_selected_peer();
         }
     }
 
-    /// Handle submit action (Enter in editing mode)
     fn handle_submit(&mut self) {
         match self.menu_state {
             MenuState::Closed => {
-                // Check if it's a slash command
                 let input = self.message_input.trim().to_string();
                 if input.starts_with('/') {
                     self.handle_slash_command(&input);
@@ -462,13 +395,10 @@ impl App {
             MenuState::ImportContact => self.import_contact(),
             MenuState::ExportContact => self.export_contact(),
             MenuState::Settings => self.submit_settings(),
-            _ => {
-                self.input_mode = InputMode::Normal;
-            }
+            _ => { self.input_mode = InputMode::Normal; }
         }
     }
 
-    /// Handle slash commands (Claude Code style)
     fn handle_slash_command(&mut self, command: &str) {
         match command {
             "/contacts" | "/c" => {
@@ -494,9 +424,7 @@ impl App {
                 self.clear_message_input();
                 self.input_mode = InputMode::Normal;
             }
-            "/quit" | "/q" => {
-                self.should_quit = true;
-            }
+            "/quit" | "/q" => { self.should_quit = true; }
             _ => {
                 self.status_message = format!("Unknown command: {}", command);
                 self.clear_message_input();
@@ -505,11 +433,10 @@ impl App {
         }
     }
 
-    /// Submit message in Messages view
     fn submit_message(&mut self) {
         if self.message_input.trim().is_empty() {
             self.input_mode = InputMode::Normal;
-            self.status_message = "".to_string();
+            self.status_message.clear();
             return;
         }
 
@@ -529,136 +456,20 @@ impl App {
             }
         };
 
-        let message_content = self.message_input.clone();
+        let plaintext = self.message_input.clone();
 
-        // Send the message
-        match self.send_message_to_peer(&peer, &message_content) {
-            Ok(message_id) => {
-                self.status_message = "Sent".to_string();
-                self.clear_message_input();
-
-                // Reload messages to show the sent message
-                self.load_messages_for_selected_peer();
-
-                // Reset polling interval - user is active
-                self.current_polling_interval = 5; // show immediately, backend will confirm
-                self.reset_polling_interval();
-
-                crate::logger::log_to_file(&format!("Message sent: {}", message_id));
-            }
-            Err(e) => {
-                self.status_message = format!("Send failed: {}", e);
-                crate::logger::log_to_file(&format!("Failed to send message: {}", e));
-            }
-        }
-
+        // Send command to daemon (async, non-blocking)
+        self.daemon.send_message(&peer.queue_id, &plaintext, &peer.encrypt_pk);
+        self.status_message = "Sending...".to_string();
+        self.clear_message_input();
         self.input_mode = InputMode::Normal;
+
+        // Tell daemon to reset polling interval (user is active)
+        self.daemon.reset_polling_interval();
     }
 
-    /// Send a message to a peer
-    fn send_message_to_peer(&self, peer: &Peer, plaintext: &str) -> Result<String, String> {
-        // Parse recipient's public keys
-        let recipient_encrypt_pk = crypto::from_hex(&peer.encrypt_pk)?;
-        let _recipient_sign_pk = crypto::from_hex(&peer.sign_pk)?;
-
-        // Create message payload
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
-
-        let payload = serde_json::json!({
-            "type": "text",
-            "content": plaintext,
-            "timestamp": timestamp,
-            "sender_id": crypto::to_hex(&self.keypair.encrypt_pk),
-        });
-
-        let payload_bytes = serde_json::to_vec(&payload)
-            .map_err(|e| format!("Failed to serialize payload: {}", e))?;
-
-        // Encrypt the message (includes sender's encrypt PK prepended for decryption)
-        let mut message_to_sign = self.keypair.encrypt_pk.clone();
-        let encrypted = crypto::encrypt_message(&payload_bytes, &recipient_encrypt_pk, &self.keypair.encrypt_sk)?;
-        message_to_sign.extend(encrypted);
-
-        // Sign the message with sender's signing key
-        let signed = crypto::sign_message(&message_to_sign, &self.keypair.sign_sk)?;
-
-        // Final format: [sender_sign_pk (32)] + [signed_message]
-        let mut final_message = self.keypair.sign_pk.clone();
-        final_message.extend(signed);
-
-        // Encode to base64
-        use base64::{Engine as _, engine::general_purpose};
-        let encoded = general_purpose::STANDARD.encode(&final_message);
-
-        // Send to recipient's mailbox queue (synchronous - we'll spawn a task)
-        let server_url = self.config.server_url.clone();
-        let queue_id = peer.queue_id.clone();
-        let message_id = uuid::Uuid::new_v4().to_string();
-
-        // Save to local database FIRST (synchronously)
-        let local_message = storage::Message {
-            id: message_id.clone(),
-            queue_id: queue_id.clone(),
-            sender: "You".to_string(),
-            content: plaintext.to_string(),
-            timestamp,
-            msg_type: "text".to_string(),
-            status: "sending".to_string(),
-            is_outbound: true,
-        };
-
-        storage::save_message(&self.db_conn, &local_message)
-            .map_err(|e| format!("Failed to save message locally: {}", e))?;
-
-        // Then spawn async task to send to server
-        let message_id_clone = message_id.clone();
-        let db_conn_path = storage::get_app_data_dir()
-            .map(|p| p.join("data/messages.db"))
-            .map_err(|e| format!("Failed to get DB path: {}", e))?;
-
-        tokio::spawn(async move {
-            use crate::mailbox::{MailboxClient, MessageMeta};
-
-            let mailbox_client = MailboxClient::new(server_url);
-            match mailbox_client.send_message(&queue_id, encoded, MessageMeta {
-                filename: None,
-                size: None,
-            }).await {
-                Ok(server_msg_id) => {
-                    crate::logger::log_to_file(&format!("Message posted to server: {}", server_msg_id));
-
-                    // Update status to "sent"
-                    if let Ok(conn) = rusqlite::Connection::open(&db_conn_path) {
-                        let _ = conn.execute(
-                            "UPDATE messages SET status = 'sent' WHERE id = ?1",
-                            [&message_id_clone],
-                        );
-                    }
-                }
-                Err(e) => {
-                    crate::logger::log_to_file(&format!("Failed to post message to server: {}", e));
-
-                    // Update status to "failed"
-                    if let Ok(conn) = rusqlite::Connection::open(&db_conn_path) {
-                        let _ = conn.execute(
-                            "UPDATE messages SET status = 'failed' WHERE id = ?1",
-                            [&message_id_clone],
-                        );
-                    }
-                }
-            }
-        });
-
-        Ok(message_id)
-    }
-
-
-    /// Import a contact from JSON (or file path)
     fn import_contact(&mut self) {
-        let input = self.contact_import_input.trim();
+        let input = self.contact_import_input.trim().to_string();
 
         if input.is_empty() {
             self.status_message = "Empty input".to_string();
@@ -666,19 +477,15 @@ impl App {
             return;
         }
 
-        // Try to parse as JSON first, if that fails try as file path
+        // Try to parse as JSON or file path
         let json_str = if input.starts_with('{') {
-            // Looks like JSON
-            input.to_string()
+            input.clone()
         } else {
-            // Assume it's a file path
             let file_path = if input.starts_with('/') || input.starts_with('~') {
-                // Absolute path
-                std::path::PathBuf::from(shellexpand::tilde(input).to_string())
+                std::path::PathBuf::from(shellexpand::tilde(&input).to_string())
             } else {
-                // Relative to app data directory
-                match storage::get_app_data_dir() {
-                    Ok(dir) => dir.join(input),
+                match crate::storage::get_app_data_dir() {
+                    Ok(dir) => dir.join(&input),
                     Err(e) => {
                         self.status_message = format!("Failed to get data dir: {}", e);
                         self.input_mode = InputMode::Normal;
@@ -697,205 +504,64 @@ impl App {
             }
         };
 
-        // Parse JSON
-        let contact_data: serde_json::Value = match serde_json::from_str(&json_str) {
-            Ok(data) => data,
-            Err(e) => {
-                self.status_message = format!("Invalid JSON: {}", e);
-                self.input_mode = InputMode::Normal;
-                return;
-            }
-        };
-
-        // Extract fields
-        let name = match contact_data["name"].as_str() {
-            Some(n) => n.to_string(),
-            None => {
-                self.status_message = "✗ Missing 'name' field".to_string();
-                self.input_mode = InputMode::Normal;
-                return;
-            }
-        };
-
-        let encrypt_pk = match contact_data["encrypt_pk"].as_str() {
-            Some(pk) => pk.to_string(),
-            None => {
-                self.status_message = "✗ Missing 'encrypt_pk' field".to_string();
-                self.input_mode = InputMode::Normal;
-                return;
-            }
-        };
-
-        let sign_pk = match contact_data["sign_pk"].as_str() {
-            Some(pk) => pk.to_string(),
-            None => {
-                self.status_message = "✗ Missing 'sign_pk' field".to_string();
-                self.input_mode = InputMode::Normal;
-                return;
-            }
-        };
-
-        // Validate hex format
-        if let Err(e) = crypto::from_hex(&encrypt_pk) {
-            self.status_message = format!("✗ Invalid encrypt_pk: {}", e);
-            self.input_mode = InputMode::Normal;
-            return;
-        }
-
-        if let Err(e) = crypto::from_hex(&sign_pk) {
-            self.status_message = format!("✗ Invalid sign_pk: {}", e);
-            self.input_mode = InputMode::Normal;
-            return;
-        }
-
-        // Check if trying to import own contact
-        let my_encrypt_pk = crypto::to_hex(&self.keypair.encrypt_pk);
-        if encrypt_pk == my_encrypt_pk {
-            self.status_message = "Cannot import your own contact".to_string();
-            self.input_mode = InputMode::Normal;
-            self.contact_import_input.clear();
-            return;
-        }
-
-        // Check for duplicates
-        if self.peers.iter().any(|p| p.encrypt_pk == encrypt_pk) {
-            self.status_message = "Contact already exists".to_string();
-            self.input_mode = InputMode::Normal;
-            self.contact_import_input.clear();
-            return;
-        }
-
-        // Generate deterministic queue_id
-        let my_encrypt_pk_hex = crypto::to_hex(&self.keypair.encrypt_pk);
-        let queue_id = match crypto::generate_conversation_queue_id(&my_encrypt_pk_hex, &encrypt_pk) {
-            Ok(qid) => qid,
-            Err(e) => {
-                self.status_message = format!("✗ Failed to generate queue_id: {}", e);
-                self.input_mode = InputMode::Normal;
-                return;
-            }
-        };
-
-        // Create and save peer
-        let peer = Peer {
-            name: name.clone(),
-            encrypt_pk,
-            sign_pk,
-            queue_id: queue_id.clone(),
-        };
-
-        match storage::save_peer(&peer) {
-            Ok(_) => {
-                self.peers.push(peer);
-                self.status_message = format!("Contact '{}' imported", name);
-                self.contact_import_input.clear();
-                self.menu_state = MenuState::Closed;
-                crate::logger::log_to_file(&format!("Contact imported: {} ({})", name, queue_id));
-            }
-            Err(e) => {
-                self.status_message = format!("Import failed: {}", e);
-            }
-        }
-
+        // Send to daemon — response handled in handle_daemon_event
+        self.daemon.import_contact(&json_str);
+        self.status_message = "Importing...".to_string();
         self.input_mode = InputMode::Normal;
     }
 
-    /// Export contact info as JSON to file
     fn export_contact(&mut self) {
-        let name = self.contact_export_name.trim();
+        let name = self.contact_export_name.trim().to_string();
 
         if name.is_empty() {
             self.status_message = "Name cannot be empty".to_string();
             return;
         }
 
-        let contact_json = serde_json::json!({
-            "name": name,
-            "encrypt_pk": crypto::to_hex(&self.keypair.encrypt_pk),
-            "sign_pk": crypto::to_hex(&self.keypair.sign_pk),
-        });
-
-        let json_string = serde_json::to_string_pretty(&contact_json)
-            .unwrap_or_else(|_| "Error generating JSON".to_string());
-
-        // Save to Downloads folder
-        if let Some(home_dir) = dirs::home_dir() {
-            let downloads_dir = home_dir.join("Downloads");
-            let file_path = downloads_dir.join(format!("contact-{}.json", name.replace(" ", "-")));
-
-            match std::fs::write(&file_path, &json_string) {
-                Ok(_) => {
-                    self.status_message = format!("✓ Saved to Downloads: contact-{}.json", name.replace(" ", "-"));
-                    self.contact_export_json = json_string;
-                    self.input_mode = InputMode::Normal;
-
-                    crate::logger::log_to_file(&format!("Contact exported to: {}", file_path.display()));
-                }
-                Err(e) => {
-                    self.status_message = format!("Failed to write file: {}", e);
-                    crate::logger::log_to_file(&format!("Export failed: {}", e));
-                }
-            }
-        } else {
-            self.status_message = "Failed to find Downloads folder".to_string();
-        }
+        self.daemon.export_contact(&name);
+        self.status_message = "Exporting...".to_string();
+        self.input_mode = InputMode::Normal;
     }
 
-    /// Submit settings changes
     fn submit_settings(&mut self) {
-        // Field 2 = "Start at Login" toggle (not a text field)
         if self.settings_selected_field == 2 {
             let now_enabled = toggle_autostart();
             self.settings_autostart_enabled = check_autostart_enabled();
             if now_enabled {
-                self.status_message = "✓ Daemon will start at login".to_string();
+                self.status_message = "Daemon will start at login".to_string();
             } else {
-                self.status_message = "✓ Autostart disabled".to_string();
+                self.status_message = "Autostart disabled".to_string();
             }
             return;
         }
 
-        // Validate and save settings
-        let new_url = self.settings_server_url.trim();
-        let new_interval_str = self.settings_polling_interval.trim();
+        let new_url = self.settings_server_url.trim().to_string();
+        let new_interval_str = self.settings_polling_interval.trim().to_string();
 
-        // Validate URL (basic check)
         if !new_url.starts_with("http://") && !new_url.starts_with("https://") {
-            self.status_message = "✗ Invalid URL (must start with http:// or https://)".to_string();
+            self.status_message = "Invalid URL (must start with http:// or https://)".to_string();
             self.input_mode = InputMode::Normal;
             return;
         }
 
-        // Validate interval
         let new_interval = match new_interval_str.parse::<u64>() {
             Ok(val) if val > 0 => val,
             _ => {
-                self.status_message = "✗ Invalid interval (must be positive number)".to_string();
+                self.status_message = "Invalid interval (must be positive number)".to_string();
                 self.input_mode = InputMode::Normal;
                 return;
             }
         };
 
-        // Update config
-        self.config.server_url = new_url.to_string();
+        self.config.server_url = new_url.clone();
         self.config.polling_interval_secs = new_interval;
 
-        // Save to file
-        match storage::save_config(&self.config) {
-            Ok(_) => {
-                self.status_message = "Settings saved (restart to apply)".to_string();
-                crate::logger::log_to_file(&format!("Settings saved: URL={}, Interval={}s", new_url, new_interval));
-            }
-            Err(e) => {
-                self.status_message = format!("Save failed: {}", e);
-                crate::logger::log_to_file(&format!("Failed to save config: {}", e));
-            }
-        }
-
+        // Send to daemon
+        self.daemon.update_config(&new_url, new_interval);
+        self.status_message = "Settings saved (restart daemon to apply)".to_string();
         self.input_mode = InputMode::Normal;
     }
 
-    /// Handle backspace in editing mode
     fn handle_backspace(&mut self) {
         match self.menu_state {
             MenuState::Closed => {
@@ -919,7 +585,6 @@ impl App {
         }
     }
 
-    /// Delete character at cursor (Delete key)
     fn handle_delete(&mut self) {
         if self.menu_state == MenuState::Closed {
             let max = self.message_input.chars().count();
@@ -931,7 +596,6 @@ impl App {
         }
     }
 
-    /// Handle character input in editing mode
     fn handle_char_input(&mut self, c: char) {
         match self.menu_state {
             MenuState::Closed => {
@@ -952,54 +616,18 @@ impl App {
         }
     }
 
-    /// Handle new message received from polling service
-    fn handle_new_message(&mut self, message: Message) {
-        // Save to database (already done by polling service)
-        // Reload messages if viewing this conversation
-        if let Some(peer) = self.peers.get(self.selected_peer_index) {
-            if peer.queue_id == message.queue_id {
-                self.load_messages_for_selected_peer();
-            }
-        }
-
-        self.status_message = format!("← {}", message.sender);
-    }
-
-    /// Load messages for the currently selected peer
+    /// Request messages reload from daemon
     fn load_messages_for_selected_peer(&mut self) {
         if let Some(peer) = self.peers.get(self.selected_peer_index) {
-            match storage::load_messages_for_queue(&self.db_conn, &peer.queue_id) {
-                Ok(messages) => {
-                    self.messages = messages;
-                    self.chat_scroll_offset = 0;
-                    self.status_message = "".to_string();
-                }
-                Err(e) => {
-                    self.status_message = format!("Load error: {}", e);
-                }
-            }
+            self.daemon.load_messages(&peer.queue_id);
         }
     }
 
-    /// Clear message input and reset cursor
     fn clear_message_input(&mut self) {
         self.message_input.clear();
         self.input_cursor = 0;
     }
 
-    /// Set the polling command sender
-    pub fn set_polling_sender(&mut self, sender: tokio::sync::mpsc::UnboundedSender<crate::backend::PollingCommand>) {
-        self.polling_sender = Some(sender);
-    }
-
-    /// Reset polling interval to minimum (user is active)
-    fn reset_polling_interval(&self) {
-        if let Some(sender) = &self.polling_sender {
-            let _ = sender.send(crate::backend::PollingCommand::ResetInterval);
-        }
-    }
-
-    /// Get available slash commands filtered by current input
     pub fn get_filtered_slash_commands(&self) -> Vec<(&'static str, &'static str)> {
         let all_commands = vec![
             ("/import", "Import a contact from JSON"),
@@ -1012,10 +640,8 @@ impl App {
         let filter = self.message_input.trim().to_lowercase();
 
         if filter == "/" {
-            // Show all commands
             all_commands
         } else {
-            // Filter by what's typed
             all_commands.into_iter()
                 .filter(|(cmd, _)| cmd.starts_with(&filter))
                 .collect()
@@ -1023,7 +649,6 @@ impl App {
     }
 }
 
-/// Convert a char index to a byte index in a UTF-8 string.
 pub fn char_to_byte_index(s: &str, char_idx: usize) -> usize {
     s.char_indices()
         .nth(char_idx)
@@ -1031,9 +656,7 @@ pub fn char_to_byte_index(s: &str, char_idx: usize) -> usize {
         .unwrap_or(s.len())
 }
 
-/// Build the auto-launch handle for the daemon
 fn make_auto_launch() -> Option<auto_launch::AutoLaunch> {
-    // Find the daemon binary next to the current executable
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
     let daemon = dir.join("trassenger-daemon");
@@ -1047,14 +670,12 @@ fn make_auto_launch() -> Option<auto_launch::AutoLaunch> {
         .ok()
 }
 
-/// Check if the daemon is configured for autostart
 pub fn check_autostart_enabled() -> bool {
     make_auto_launch()
         .and_then(|al| al.is_enabled().ok())
         .unwrap_or(false)
 }
 
-/// Toggle the daemon autostart setting
 pub fn toggle_autostart() -> bool {
     if let Some(al) = make_auto_launch() {
         let enabled = al.is_enabled().unwrap_or(false);
